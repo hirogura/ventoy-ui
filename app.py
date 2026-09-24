@@ -23,7 +23,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import urlparse
 
-VERSION = "v0.0.2"
+VERSION = "v0.0.3"
 PORT = 3363
 BASE_DIR = Path(__file__).resolve().parent
 VENTOY_DIR = Path("/opt/ventoy")
@@ -429,6 +429,277 @@ def sh_quote(s: str) -> str:
     return "'" + s.replace("'", "'\\''") + "'"
 
 
+# ========== ISOイメージダウンロード (Ventoyパーティションへの保存) ==========
+# USBメモリ / qcow2・img イメージ内の Ventoyデータパーティション (第2パーティション)
+# を /mnt/ventoy-iso にマウントし、URL指定で ISO を直接保存する。
+# URL入力・検証・進捗・キャンセルの流儀は cachy-UI の Limine編集
+# 「または直接URLを入力」ダウンロードに合わせている。
+ISO_MOUNT_POINT = Path("/mnt/ventoy-iso")
+NBD_DEV = "/dev/nbd0"
+
+_iso_lock = threading.Lock()
+_iso_mount = {"mounted": False, "target_type": "", "target": "",
+              "part": "", "label": "", "backend": "", "backing_dev": ""}
+_iso_dl = {"running": False, "filename": "", "received": 0, "total": -1,
+           "done": False, "success": None, "message": "", "cancel": False}
+
+
+def second_partition(device: str) -> str:
+    """ディスク全体のデバイス名から第2パーティション名を求める。"""
+    base = device.rstrip("/")
+    # /dev/nvme0n1 / /dev/mmcblk0 / /dev/vda 等の末尾数字系は p を挿入
+    if re.search(r"[0-9]$", base):
+        return f"{base}p2"
+    return f"{base}2"
+
+
+def part_label(part: str) -> str:
+    try:
+        r = subprocess.run(["blkid", "-o", "value", "-s", "LABEL", part],
+                           capture_output=True, text=True, timeout=10)
+        return (r.stdout or "").strip()
+    except Exception:  # noqa: BLE001
+        return ""
+
+
+def mountpoint_active() -> bool:
+    try:
+        r = subprocess.run(["findmnt", "-n", str(ISO_MOUNT_POINT)],
+                           capture_output=True, timeout=10)
+        return r.returncode == 0
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def wait_for_dev(path: str, timeout: int = 15) -> bool:
+    for _ in range(timeout * 2):
+        if os.path.exists(path):
+            return True
+        time.sleep(0.5)
+    return False
+
+
+def iso_mount(target_type: str, target: str):
+    """Ventoyデータパーティションをマウントする。戻り値 (ok, message)。"""
+    with _iso_lock:
+        if _iso_mount["mounted"] or mountpoint_active():
+            return False, "既にマウントされています。先にアンマウントしてください。"
+    if task_snapshot()["running"]:
+        return False, "他の処理 (ダウンロード/書き込み) が実行中です。完了後に操作してください。"
+    ISO_MOUNT_POINT.mkdir(parents=True, exist_ok=True)
+    backend, backing, part = "direct", "", ""
+    try:
+        if target_type == "image":
+            if not target or not os.path.isabs(target):
+                return False, "イメージパスは絶対パスで指定してください。"
+            if not os.path.isfile(target):
+                return False, f"イメージファイルが存在しません: {target}"
+            if target.endswith(".qcow2"):
+                if not shutil.which("qemu-nbd"):
+                    return False, "qcow2 のマウントには qemu-img が必要です (sudo pacman -S qemu-img)。"
+                subprocess.run(["modprobe", "nbd", "max_part=8"],
+                               capture_output=True, timeout=30)
+                r = subprocess.run(["qemu-nbd", "--connect", NBD_DEV, target],
+                                   capture_output=True, text=True, timeout=60)
+                if r.returncode != 0:
+                    return False, f"qemu-nbd 接続失敗: {(r.stderr or '').strip()}"
+                backend, backing, part = "nbd", NBD_DEV, f"{NBD_DEV}p2"
+            else:
+                if not shutil.which("losetup"):
+                    return False, "イメージのマウントには losetup が必要です (util-linux)。"
+                r = subprocess.run(["losetup", "-f", "--show", "-P", target],
+                                   capture_output=True, text=True, timeout=60)
+                loop = (r.stdout or "").strip()
+                if r.returncode != 0 or not loop:
+                    return False, f"loop デバイスの割り当てに失敗: {(r.stderr or '').strip()}"
+                backend, backing, part = "loop", loop, f"{loop}p2"
+            if not wait_for_dev(part):
+                iso_cleanup_backend(backend, backing)
+                return False, f"パーティション {part} が現れません。イメージ内にVentoyが書き込まれていますか?"
+        else:
+            if not target.startswith("/dev/"):
+                return False, "USBドライブを選択してください (例: /dev/sdb)。"
+            part = second_partition(target)
+            if not os.path.exists(part):
+                return False, f"{part} が見つかりません。先に Ventoy を書き込んでください。"
+        r = subprocess.run(["mount", part, str(ISO_MOUNT_POINT)],
+                           capture_output=True, text=True, timeout=60)
+        if r.returncode != 0:
+            if backend in ("nbd", "loop"):
+                iso_cleanup_backend(backend, backing)
+            return False, f"マウント失敗 ({part}): {(r.stderr or '').strip()}"
+        label = part_label(part)
+        with _iso_lock:
+            _iso_mount.update({"mounted": True, "target_type": target_type,
+                               "target": target, "part": part, "label": label,
+                               "backend": backend, "backing_dev": backing})
+        return True, f"{part} を {ISO_MOUNT_POINT} にマウントしました" + (f" (ラベル: {label})" if label else "")
+    except Exception as e:  # noqa: BLE001
+        try:
+            subprocess.run(["umount", str(ISO_MOUNT_POINT)],
+                           capture_output=True, timeout=30)
+        except Exception:  # noqa: BLE001
+            pass
+        if backend in ("nbd", "loop") and backing:
+            iso_cleanup_backend(backend, backing)
+        return False, f"マウント中にエラー: {e}"
+
+
+def iso_cleanup_backend(backend: str, backing: str):
+    try:
+        if backend == "nbd" and backing:
+            subprocess.run(["qemu-nbd", "--disconnect", backing],
+                           capture_output=True, timeout=60)
+        elif backend == "loop" and backing:
+            subprocess.run(["losetup", "-d", backing],
+                           capture_output=True, timeout=60)
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def iso_unmount():
+    """マウント解除 + バックエンド後始末。戻り値 (ok, message)。"""
+    if task_snapshot()["running"]:
+        return False, "他の処理 (ダウンロード/書き込み) が実行中です。完了後に操作してください。"
+    with _iso_lock:
+        if _iso_dl["running"]:
+            return False, "ISOダウンロード実行中です。先にキャンセルしてください。"
+        backend = _iso_mount["backend"]
+        backing = _iso_mount["backing_dev"]
+        was_mounted = _iso_mount["mounted"] or mountpoint_active()
+    if not was_mounted:
+        return False, "マウントされていません。"
+    r = subprocess.run(["umount", str(ISO_MOUNT_POINT)],
+                       capture_output=True, text=True, timeout=60)
+    if r.returncode != 0:
+        r = subprocess.run(["umount", "-l", str(ISO_MOUNT_POINT)],
+                           capture_output=True, text=True, timeout=60)
+        if r.returncode != 0:
+            return False, f"アンマウント失敗: {(r.stderr or '').strip()}"
+    if backend in ("nbd", "loop") and backing:
+        iso_cleanup_backend(backend, backing)
+    with _iso_lock:
+        _iso_mount.update({"mounted": False, "target_type": "", "target": "",
+                           "part": "", "label": "", "backend": "", "backing_dev": ""})
+    return True, "アンマウントしました。"
+
+
+def iso_list_files():
+    files = []
+    if not mountpoint_active():
+        return files
+    try:
+        for name in sorted(os.listdir(ISO_MOUNT_POINT)):
+            if not name.lower().endswith(".iso"):
+                continue
+            try:
+                size = os.path.getsize(ISO_MOUNT_POINT / name)
+            except OSError:
+                size = -1
+            files.append({"name": name, "size": size})
+    except OSError:
+        pass
+    return files
+
+
+def iso_status():
+    with _iso_lock:
+        m = dict(_iso_mount)
+        d = dict(_iso_dl)
+    if not m["mounted"]:
+        # 前回起動時の残留マウント等を反映
+        m["mounted"] = mountpoint_active()
+    d.pop("cancel", None)
+    return {"mounted": m["mounted"], "target_type": m["target_type"],
+            "target": m["target"], "part": m["part"], "label": m["label"],
+            "mountpoint": str(ISO_MOUNT_POINT),
+            "files": iso_list_files() if m["mounted"] else [],
+            "download": d}
+
+
+def iso_download_worker(url: str, dest: str, filename: str, total: int):
+    try:
+        req = urllib.request.Request(url, headers={"User-Agent": "Ventoy-UI"})
+        with urllib.request.urlopen(req, timeout=60) as resp, open(dest, "wb") as f:
+            while True:
+                with _iso_lock:
+                    if _iso_dl["cancel"]:
+                        break
+                chunk = resp.read(1024 * 256)
+                if not chunk:
+                    break
+                f.write(chunk)
+                with _iso_lock:
+                    _iso_dl["received"] += len(chunk)
+        with _iso_lock:
+            if _iso_dl["cancel"]:
+                _iso_dl.update({"running": False, "done": True,
+                                "success": False, "message": "キャンセルしました。"})
+                try:
+                    os.unlink(dest)
+                except OSError:
+                    pass
+            else:
+                _iso_dl.update({"running": False, "done": True,
+                                "success": True,
+                                "message": f"ダウンロード完了: {filename}"})
+    except Exception as e:  # noqa: BLE001
+        with _iso_lock:
+            _iso_dl.update({"running": False, "done": True,
+                            "success": False, "message": f"ダウンロード失敗: {e}"})
+        try:
+            if os.path.exists(dest):
+                os.unlink(dest)
+        except OSError:
+            pass
+
+
+def iso_start_download(url: str):
+    """cachy-UI同様の検証後にバックグラウンドダウンロードを開始する。"""
+    if not re.match(r"^https?://", url):
+        return {"ok": False, "message": "http:// または https:// で始まるURLを入力してください"}
+    if any(ch in url for ch in ('"', "'", "`", "\\", "\n", "\r", "$", ";", "&", "|", "<", ">")):
+        return {"ok": False, "message": "URLに使用できない文字が含まれています"}
+    fname = os.path.basename(urlparse(url).path)
+    if not fname.lower().endswith(".iso"):
+        return {"ok": False, "message": "URLの末尾が .iso となっている直接リンクを指定してください"}
+    if any(ch in fname for ch in ('"', "'", "`", "\\", "$", ";", "&", "|", "<", ">")):
+        return {"ok": False, "message": "ファイル名に使用できない文字が含まれています"}
+    with _iso_lock:
+        if not (_iso_mount["mounted"] and mountpoint_active()):
+            return {"ok": False, "message": "保存先がマウントされていません。先にマウントしてください。"}
+        if _iso_dl["running"]:
+            return {"ok": False, "message": "ダウンロードが既に実行中です"}
+    dest = str(ISO_MOUNT_POINT / fname)
+    if os.path.exists(dest):
+        return {"ok": False, "message": f"同名のファイルが既に存在します: {fname}"}
+    total = -1
+    try:
+        req = urllib.request.Request(url, method="HEAD",
+                                     headers={"User-Agent": "Ventoy-UI"})
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            length = resp.headers.get("Content-Length")
+            if length and length.isdigit():
+                total = int(length)
+    except Exception:  # noqa: BLE001
+        total = -1
+    with _iso_lock:
+        _iso_dl.update({"running": True, "filename": fname, "received": 0,
+                        "total": total, "done": False, "success": None,
+                        "message": "ダウンロード中...", "cancel": False})
+    threading.Thread(target=iso_download_worker,
+                     args=(url, dest, fname, total), daemon=True).start()
+    return {"ok": True, "filename": fname}
+
+
+def iso_cancel_download():
+    with _iso_lock:
+        if not _iso_dl["running"]:
+            return {"ok": False, "message": "実行中のダウンロードはありません"}
+        _iso_dl["cancel"] = True
+    return {"ok": True, "message": "キャンセル要求を送信しました"}
+
+
 class Handler(BaseHTTPRequestHandler):
     server_version = f"Ventoy-UI/{VERSION}"
 
@@ -465,6 +736,8 @@ class Handler(BaseHTTPRequestHandler):
             })
         elif parsed.path == "/api/task":
             self._send_json(task_snapshot())
+        elif parsed.path == "/api/iso/status":
+            self._send_json(iso_status())
         else:
             self._send_json({"error": "not found"}, 404)
 
@@ -498,6 +771,19 @@ class Handler(BaseHTTPRequestHandler):
         elif parsed.path == "/api/restart":
             self._send_json({"ok": True, "message": "再起動します"})
             threading.Thread(target=restart_self, daemon=True).start()
+        elif parsed.path == "/api/iso/mount":
+            ttype = params.get("target_type", "usb")
+            tgt = (params.get("image_path") if ttype == "image"
+                   else params.get("device")) or ""
+            ok, msg = iso_mount(ttype, tgt.strip())
+            self._send_json({"ok": ok, "message": msg})
+        elif parsed.path == "/api/iso/unmount":
+            ok, msg = iso_unmount()
+            self._send_json({"ok": ok, "message": msg})
+        elif parsed.path == "/api/iso/download":
+            self._send_json(iso_start_download((params.get("url") or "").strip()))
+        elif parsed.path == "/api/iso/cancel":
+            self._send_json(iso_cancel_download())
         else:
             self._send_json({"error": "not found"}, 404)
 

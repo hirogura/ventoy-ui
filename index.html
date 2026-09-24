@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Ventoy-UI v0.0.2</title>
+<title>Ventoy-UI v0.0.3</title>
 <style>
   body { font-family: sans-serif; max-width: 760px; margin: 0 auto; padding: 16px; background: #f4f6f8; color: #222; }
   h1 { font-size: 1.6em; }
@@ -18,12 +18,18 @@
   .row { display: flex; gap: 12px; flex-wrap: wrap; }
   .row > div { flex: 1; min-width: 200px; }
   #log { background: #111; color: #0f0; font-family: monospace; font-size: .85em; height: 280px; overflow-y: auto; white-space: pre-wrap; padding: 10px; border-radius: 8px; }
+  .progress { background: #e0e0e0; border-radius: 6px; height: 12px; overflow: hidden; }
+  .progress > div { background: #1976d2; height: 100%; width: 0%; transition: width .3s; }
+  .progress-text { font-size: .8em; color: #666; margin-top: 4px; }
+  .status-msg { margin: 6px 0; font-size: .9em; }
+  #isoFiles { font-size: .9em; }
+  #isoFiles li { margin: 2px 0; }
   .muted { color: #666; font-size: .9em; }
   .warn { color: #c62828; font-weight: bold; }
 </style>
 </head>
 <body>
-<h1>Ventoy-UI <span id="version">v0.0.2</span></h1>
+<h1>Ventoy-UI <span id="version">v0.0.3</span></h1>
 <p class="muted">CachyOS (デスクトップ環境なし) 向け Ventoy 作成 Web-UI ・ 3363番ポートで公開</p>
 
 <div class="card">
@@ -88,6 +94,33 @@
 </div>
 
 <div class="card">
+  <h2>5. ISOイメージダウンロード</h2>
+  <p class="muted">USBメモリ / qcow2・img イメージ内のVentoyパーティション (第2パーティション) をマウントし、URL指定でISOイメージを直接保存します。qcow2のマウントには qemu-img が必要です (<code>sudo pacman -S qemu-img</code>)。</p>
+  <p>保存先の状態: <span id="isoMountStatus">確認中...</span></p>
+  <label><input type="radio" name="iso_target_type" value="usb" checked onchange="toggleIsoTarget()"> USBドライブのVentoyパーティション</label>
+  <label><input type="radio" name="iso_target_type" value="image" onchange="toggleIsoTarget()"> イメージファイル内のVentoyパーティション</label>
+  <div id="isoUsbBox">
+    <select id="iso_device"><option value="">-- 読込中 --</option></select>
+  </div>
+  <div id="isoImgBox" style="display:none">
+    <input type="text" id="iso_image_path" value="/opt/ventoy.qcow2" placeholder="/opt/ventoy.qcow2">
+  </div>
+  <button id="btnIsoMount" onclick="isoMount()">マウント</button>
+  <button id="btnIsoUnmount" onclick="isoUnmount()">アンマウント</button>
+  <h3>保存済みISO</h3>
+  <ul id="isoFiles"><li class="muted">--</li></ul>
+  <h3>または直接URLを入力</h3>
+  <input type="text" id="iso_url" placeholder="https://example.com/linux.iso">
+  <div id="isoDlProgress" style="display:none; margin: 8px 0;">
+    <div class="progress"><div id="isoDlBar"></div></div>
+    <div id="isoDlText" class="progress-text"></div>
+  </div>
+  <div id="isoDlStatus" class="status-msg"></div>
+  <button id="btnIsoDl" class="primary" onclick="isoDownload()">ダウンロード</button>
+  <button id="btnIsoCancel" onclick="isoCancel()" disabled>キャンセル</button>
+</div>
+
+<div class="card">
   <h2>管理</h2>
   <button onclick="updateSelf()">GitHubからアップデート</button>
   <button onclick="restartApp()">Ventoy-UIの再起動</button>
@@ -100,7 +133,7 @@ let logTimer = null;
 async function loadStatus() {
   const res = await fetch('/api/status');
   const j = await res.json();
-  document.getElementById('version').textContent = j.version || 'v0.0.2';
+  document.getElementById('version').textContent = j.version || 'v0.0.3';
   const st = j.ventoy_installed ? ('インストール済み' + (j.ventoy_version ? ' (' + j.ventoy_version + ')' : '')) : '未インストール';
   document.getElementById('ventoyStatus').textContent = st + ' @ ' + j.ventoy_dir;
   const sel = document.getElementById('device');
@@ -121,6 +154,23 @@ async function loadStatus() {
   }
   document.getElementById('imgCands').textContent =
     (j.images && j.images.length) ? j.images.map(i => i.path).join(', ') : '(候補なし。パスを直接入力してください)';
+  const isel = document.getElementById('iso_device');
+  const icur = isel.value;
+  isel.innerHTML = '';
+  if (!j.devices || j.devices.length === 0) {
+    const o = document.createElement('option');
+    o.value = ''; o.textContent = '-- USBドライブが見つかりません --';
+    isel.appendChild(o);
+  } else {
+    for (const d of j.devices) {
+      const o = document.createElement('option');
+      o.value = d.path;
+      o.textContent = `${d.path} (${d.size} / ${d.model} / ${d.tran})`.trim();
+      isel.appendChild(o);
+    }
+    if (icur) isel.value = icur;
+  }
+  refreshIsoStatus();
 }
 
 function toggleTarget() {
@@ -130,6 +180,129 @@ function toggleTarget() {
 }
 
 function val(name) { return document.querySelector(`input[name=${name}]:checked`).value; }
+
+function toggleIsoTarget() {
+  const t = document.querySelector('input[name=iso_target_type]:checked').value;
+  document.getElementById('isoUsbBox').style.display = t === 'usb' ? '' : 'none';
+  document.getElementById('isoImgBox').style.display = t === 'image' ? '' : 'none';
+}
+
+function fmtSize(b) {
+  if (b < 0) return '?';
+  if (b < 1024) return b + ' B';
+  const u = ['KB', 'MB', 'GB', 'TB'];
+  let v = b / 1024, i = 0;
+  while (v >= 1024 && i < u.length - 1) { v /= 1024; i++; }
+  return v.toFixed(1) + ' ' + u[i];
+}
+
+let isoTimer = null;
+
+async function refreshIsoStatus() {
+  const res = await fetch('/api/iso/status');
+  const j = await res.json();
+  const st = j.mounted
+    ? `マウント中: ${j.part}${j.label ? ' (ラベル: ' + j.label + ')' : ''} @ ${j.mountpoint}`
+    : '未マウント';
+  document.getElementById('isoMountStatus').textContent = st;
+  const ul = document.getElementById('isoFiles');
+  ul.innerHTML = '';
+  if (!j.mounted) {
+    ul.innerHTML = '<li class="muted">マウントすると保存済みISOが表示されます</li>';
+  } else if (!j.files || j.files.length === 0) {
+    ul.innerHTML = '<li class="muted">(ISOなし)</li>';
+  } else {
+    for (const f of j.files) {
+      const li = document.createElement('li');
+      li.textContent = `${f.name} (${fmtSize(f.size)})`;
+      ul.appendChild(li);
+    }
+  }
+  updateIsoDlUI(j.download);
+}
+
+function updateIsoDlUI(d) {
+  if (!d) return;
+  const prog = document.getElementById('isoDlProgress');
+  const bar = document.getElementById('isoDlBar');
+  const text = document.getElementById('isoDlText');
+  const status = document.getElementById('isoDlStatus');
+  document.getElementById('btnIsoCancel').disabled = !d.running;
+  document.getElementById('btnIsoDl').disabled = !!d.running;
+  if (d.running) {
+    prog.style.display = '';
+    if (d.total > 0) {
+      const pct = Math.min(100, d.received / d.total * 100);
+      bar.style.width = pct.toFixed(1) + '%';
+      text.textContent = `${d.filename}: ${fmtSize(d.received)} / ${fmtSize(d.total)} (${pct.toFixed(1)}%)`;
+    } else {
+      bar.style.width = '100%';
+      text.textContent = `${d.filename}: ${fmtSize(d.received)} ダウンロード中...`;
+    }
+    status.textContent = '';
+  } else {
+    if (d.done) {
+      prog.style.display = 'none';
+      status.textContent = d.message || '';
+    } else {
+      prog.style.display = 'none';
+    }
+  }
+}
+
+function pollIsoDl() {
+  if (isoTimer) clearInterval(isoTimer);
+  isoTimer = setInterval(async () => {
+    const res = await fetch('/api/iso/status');
+    const j = await res.json();
+    const ul = document.getElementById('isoFiles');
+    ul.innerHTML = '';
+    if (!j.files || j.files.length === 0) {
+      ul.innerHTML = '<li class="muted">(ISOなし)</li>';
+    } else {
+      for (const f of j.files) {
+        const li = document.createElement('li');
+        li.textContent = `${f.name} (${fmtSize(f.size)})`;
+        ul.appendChild(li);
+      }
+    }
+    updateIsoDlUI(j.download);
+    if (!j.download.running) { clearInterval(isoTimer); isoTimer = null; }
+  }, 1000);
+}
+
+async function isoMount() {
+  const t = document.querySelector('input[name=iso_target_type]:checked').value;
+  const body = t === 'usb'
+    ? {target_type: 'usb', device: document.getElementById('iso_device').value}
+    : {target_type: 'image', image_path: document.getElementById('iso_image_path').value};
+  if (t === 'usb' && !body.device) { alert('USBドライブを選択してください'); return; }
+  if (t === 'image' && !body.image_path) { alert('イメージパスを入力してください'); return; }
+  const res = await fetch('/api/iso/mount', {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(body)});
+  const j = await res.json();
+  alert(j.message);
+  refreshIsoStatus();
+}
+
+async function isoUnmount() {
+  const res = await fetch('/api/iso/unmount', {method: 'POST'});
+  const j = await res.json();
+  alert(j.message);
+  refreshIsoStatus();
+}
+
+async function isoDownload() {
+  const url = document.getElementById('iso_url').value.trim();
+  if (!url) { alert('ISOイメージのURLを入力してください'); return; }
+  const res = await fetch('/api/iso/download', {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({url})});
+  const j = await res.json();
+  if (!j.ok) { alert(j.message); refreshIsoStatus(); return; }
+  pollIsoDl();
+}
+
+async function isoCancel() {
+  await fetch('/api/iso/cancel', {method: 'POST'});
+}
 
 async function downloadVentoy() {
   if (!confirm('Ventoyを /opt/ventoy にダウンロード・展開します。よろしいですか?')) return;
@@ -197,6 +370,7 @@ function setBusy(b) {
 
 loadStatus();
 toggleTarget();
+toggleIsoTarget();
 </script>
 </body>
 </html>
