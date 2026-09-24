@@ -23,7 +23,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import urlparse
 
-VERSION = "v0.1.2"
+VERSION = "v0.1.3"
 PORT = 3363
 BASE_DIR = Path(__file__).resolve().parent
 VENTOY_DIR = Path("/opt/ventoy")
@@ -340,6 +340,7 @@ def ensure_image_file(path: str, create: bool, size_gb: float):
 
 def install_ventoy_task(params: dict):
     rc = 1
+    attach_backend, attach_dev = "", ""
     try:
         script = find_ventoy_script()
         if not script.is_file():
@@ -376,9 +377,18 @@ def install_ventoy_task(params: dict):
             if not ok:
                 task_finish(1)
                 return
-            target = image_path
+            # Ventoy2Disk.sh はブロックデバイス必須のため、イメージを
+            # ブロックデバイスとして接続してから実行する (v0.1.2までは
+            # ファイルパスを直接渡していたため "NOT a valid device" で失敗した)。
+            # qcow2→nbd が使えない・raw→loop が使えない環境では書き込めない。
+            target, attach_backend, attach_dev = attach_image_for_write(image_path)
+            if not target:
+                task_log(attach_backend)  # エラーメッセージ
+                task_finish(1)
+                return
         else:
             target = (params.get("device") or "").strip()
+            attach_backend, attach_dev = "", ""
             if not target.startswith("/dev/"):
                 task_log("USBドライブを選択してください (例: /dev/sdb)")
                 task_finish(1)
@@ -419,10 +429,50 @@ def install_ventoy_task(params: dict):
         proc.wait()
         rc = proc.returncode
         task_log(f"終了コード: {rc}")
+        if attach_backend in ("nbd", "loop") and attach_dev:
+            task_log(f"イメージの接続を解除します ({attach_dev})")
+            iso_cleanup_backend(attach_backend, attach_dev)
     except Exception as e:  # noqa: BLE001
         task_log(f"エラー: {e}")
+        try:
+            if attach_backend in ("nbd", "loop") and attach_dev:
+                iso_cleanup_backend(attach_backend, attach_dev)
+        except Exception:  # noqa: BLE001
+            pass
         rc = 1
     task_finish(rc)
+
+
+def attach_image_for_write(image_path: str):
+    """Ventoy書き込み用にイメージをブロックデバイスとして接続する。
+    戻り値 (blockdev_or_None, backend_or_errmsg, backing_dev)。
+    iso_cleanup_backend() が後始末用に流用できる形式で返す。"""
+    if image_path.endswith(".qcow2"):
+        if not shutil.which("qemu-nbd"):
+            return (None, "qcow2への書き込みには qemu-img が必要です "
+                          "(sudo pacman -S qemu-img) 。", "")
+        ok, nbd = acquire_nbd()
+        if not ok:
+            return (None, f"qcow2をブロックデバイスとして接続できません: {nbd} "
+                          "この環境ではイメージへのVentoy書き込みはできません。"
+                          "USBドライブへ書き込むか、nbd対応ホストで実行してください。", "")
+        task_log(f"qcow2を接続します: {image_path} -> {nbd}")
+        r = subprocess.run(["qemu-nbd", "--connect", nbd, image_path],
+                           capture_output=True, text=True, timeout=120)
+        if r.returncode != 0:
+            return (None, f"qemu-nbd 接続失敗 ({nbd}): {(r.stderr or '').strip()}", "")
+        return (nbd, "nbd", nbd)
+    if not shutil.which("losetup"):
+        return (None, "イメージへの書き込みには losetup が必要です (util-linux) 。", "")
+    task_log(f"イメージをloop接続します: {image_path}")
+    r = subprocess.run(["losetup", "-f", "--show", "-P", image_path],
+                       capture_output=True, text=True, timeout=60)
+    loop = (r.stdout or "").strip()
+    if r.returncode != 0 or not loop:
+        return (None, f"loopデバイスの割り当てに失敗: {(r.stderr or '').strip()} "
+                      "この環境ではイメージへのVentoy書き込みはできません。"
+                      "USBドライブへ書き込むか、loop対応ホストで実行してください。", "")
+    return (loop, "loop", loop)
 
 
 def sh_quote(s: str) -> str:
