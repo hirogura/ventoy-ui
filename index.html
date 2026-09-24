@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Ventoy-UI v0.1.0</title>
+<title>Ventoy-UI v0.1.1</title>
 <style>
   body { font-family: sans-serif; max-width: 760px; margin: 0 auto; padding: 16px; background: #f4f6f8; color: #222; }
   h1 { font-size: 1.6em; }
@@ -29,7 +29,7 @@
 </style>
 </head>
 <body>
-<h1>Ventoy-UI <span id="version">v0.1.0</span></h1>
+<h1>Ventoy-UI <span id="version">v0.1.1</span></h1>
 <p class="muted">CachyOS (デスクトップ環境なし) 向け Ventoy 作成 Web-UI ・ 3363番ポートで公開</p>
 
 <div class="card">
@@ -146,7 +146,7 @@ let logTimer = null;
 async function loadStatus() {
   const res = await fetch('/api/status');
   const j = await res.json();
-  document.getElementById('version').textContent = j.version || 'v0.1.0';
+  document.getElementById('version').textContent = j.version || 'v0.1.1';
   const st = j.ventoy_installed ? ('インストール済み' + (j.ventoy_version ? ' (' + j.ventoy_version + ')' : '')) : '未インストール';
   document.getElementById('ventoyStatus').textContent = st + ' @ ' + j.ventoy_dir;
   const sel = document.getElementById('device');
@@ -342,9 +342,15 @@ async function isoUnmount() {
 async function isoDownload() {
   const url = document.getElementById('iso_url').value.trim();
   if (!url) { alert('ISOイメージのURLを入力してください'); return; }
-  const res = await fetch('/api/iso/download', {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({url})});
-  const j = await res.json();
-  if (!j.ok) { alert(j.message); refreshIsoStatus(); return; }
+  try {
+    const res = await fetch('/api/iso/download', {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({url})});
+    const j = await res.json();
+    if (!j.ok) { alert(j.message || j.error || 'ダウンロードを開始できませんでした'); refreshIsoStatus(); return; }
+  } catch (e) {
+    alert('ダウンロード要求に失敗しました: ' + e);
+    refreshIsoStatus();
+    return;
+  }
   pollIsoDl();
 }
 

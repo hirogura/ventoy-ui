@@ -23,7 +23,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import urlparse
 
-VERSION = "v0.1.0"
+VERSION = "v0.1.1"
 PORT = 3363
 BASE_DIR = Path(__file__).resolve().parent
 VENTOY_DIR = Path("/opt/ventoy")
@@ -913,14 +913,6 @@ def iso_start_download(url: str):
             return {"ok": False, "message": f"同名のファイルが既に存在します: {fname}"}
         guest = None
         tmpdir = str(ISO_MOUNT_POINT)
-    if total > 0:
-        try:
-            free = shutil.disk_usage(tmpdir).free
-            if free < total:
-                return {"ok": False,
-                        "message": f"空き容量不足です (必要: 約{total // 1024 // 1024}MB / 空き: 約{free // 1024 // 1024}MB @ {tmpdir})"}
-        except OSError:
-            pass
     total = -1
     try:
         req = urllib.request.Request(url, method="HEAD",
@@ -931,6 +923,14 @@ def iso_start_download(url: str):
                 total = int(length)
     except Exception:  # noqa: BLE001
         total = -1
+    if total > 0:
+        try:
+            free = shutil.disk_usage(tmpdir).free
+            if free < total:
+                return {"ok": False,
+                        "message": f"空き容量不足です (必要: 約{total // 1024 // 1024}MB / 空き: 約{free // 1024 // 1024}MB @ {tmpdir})"}
+        except OSError:
+            pass
     with _iso_lock:
         _iso_dl.update({"running": True, "filename": fname, "received": 0,
                         "total": total, "done": False, "success": None,
