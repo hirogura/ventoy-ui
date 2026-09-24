@@ -23,7 +23,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import urlparse
 
-VERSION = "v0.0.3"
+VERSION = "v0.0.4"
 PORT = 3363
 BASE_DIR = Path(__file__).resolve().parent
 VENTOY_DIR = Path("/opt/ventoy")
@@ -435,7 +435,7 @@ def sh_quote(s: str) -> str:
 # URL入力・検証・進捗・キャンセルの流儀は cachy-UI の Limine編集
 # 「または直接URLを入力」ダウンロードに合わせている。
 ISO_MOUNT_POINT = Path("/mnt/ventoy-iso")
-NBD_DEV = "/dev/nbd0"
+NBD_MAX = 8  # /dev/nbd0〜nbd7 まで探索
 
 _iso_lock = threading.Lock()
 _iso_mount = {"mounted": False, "target_type": "", "target": "",
@@ -479,6 +479,53 @@ def wait_for_dev(path: str, timeout: int = 15) -> bool:
     return False
 
 
+def nbd_module_loaded() -> bool:
+    if os.path.exists("/sys/module/nbd"):
+        return True
+    try:
+        with open("/proc/devices") as f:
+            return " nbd" in f.read()
+    except OSError:
+        return False
+
+
+def acquire_nbd():
+    """空き nbd デバイスを確保する。戻り値 (ok, dev_or_message)。
+
+    /dev/nbd0 決め打ちだった v0.0.3 では、nbdモジュール未ロードや
+    デバイスノード未作成の環境で
+    "Failed to open /dev/nbd0: No such file or directory" となった。
+    """
+    modprobe_err = ""
+    if not nbd_module_loaded():
+        r = subprocess.run(["modprobe", "nbd", "max_part=8"],
+                           capture_output=True, text=True, timeout=30)
+        if r.returncode != 0:
+            modprobe_err = (r.stderr or "").strip()
+    if not nbd_module_loaded():
+        msg = "nbd カーネルモジュールが読み込めません。"
+        if modprobe_err:
+            msg += f" (modprobe: {modprobe_err})"
+        msg += " ホスト側で 'sudo modprobe nbd' を試すか、raw (.img) 形式を使用してください。"
+        return False, msg
+    for i in range(NBD_MAX):
+        dev = f"/dev/nbd{i}"
+        if not os.path.exists(dev):
+            # モジュールはあるが udev がノードを作っていない場合は自作する (major 43)
+            try:
+                os.mknod(dev, 0o660 | 0o060000, os.makedev(43, i))
+            except OSError:
+                continue
+        try:
+            with open(f"/sys/block/nbd{i}/pid") as f:
+                if f.read().strip() != "0":
+                    continue  # 使用中
+        except OSError:
+            pass  # pid 情報が無ければ空きとみなして試す
+        return True, dev
+    return False, f"/dev/nbd0〜nbd{NBD_MAX - 1} が全て使用中です。不要な接続を切断してください。"
+
+
 def iso_mount(target_type: str, target: str):
     """Ventoyデータパーティションをマウントする。戻り値 (ok, message)。"""
     with _iso_lock:
@@ -497,13 +544,14 @@ def iso_mount(target_type: str, target: str):
             if target.endswith(".qcow2"):
                 if not shutil.which("qemu-nbd"):
                     return False, "qcow2 のマウントには qemu-img が必要です (sudo pacman -S qemu-img)。"
-                subprocess.run(["modprobe", "nbd", "max_part=8"],
-                               capture_output=True, timeout=30)
-                r = subprocess.run(["qemu-nbd", "--connect", NBD_DEV, target],
+                ok, nbd = acquire_nbd()
+                if not ok:
+                    return False, nbd
+                r = subprocess.run(["qemu-nbd", "--connect", nbd, target],
                                    capture_output=True, text=True, timeout=60)
                 if r.returncode != 0:
-                    return False, f"qemu-nbd 接続失敗: {(r.stderr or '').strip()}"
-                backend, backing, part = "nbd", NBD_DEV, f"{NBD_DEV}p2"
+                    return False, f"qemu-nbd 接続失敗 ({nbd}): {(r.stderr or '').strip()}"
+                backend, backing, part = "nbd", nbd, f"{nbd}p2"
             else:
                 if not shutil.which("losetup"):
                     return False, "イメージのマウントには losetup が必要です (util-linux)。"

@@ -1,4 +1,4 @@
-# ventoy-ui v0.0.3
+# ventoy-ui v0.0.4
 
 CachyOS (デスクトップ環境なし) で Webブラウザから Ventoy USB を作成するための Web-UI。
 GUI相当の設定をブラウザから行える。
@@ -17,6 +17,8 @@ GUI相当の設定をブラウザから行える。
 - URL入力欄に `.iso` の直接リンクを入力してダウンロード (cachy-UI の Limine編集
   「または直接URLを入力」と同じ流儀: URL検証・進捗バー・キャンセル付き)
 - qcow2 のマウントには `qemu-img` が必要 (`sudo pacman -S qemu-img`)。raw (.img) は `losetup` で対応
+- qcow2 マウント時は nbdモジュールのロード・空き `/dev/nbdN` の自動確保を行う
+  (モジュールが無い環境では理由付きのエラーを表示)
 
 ## 使い方
 
