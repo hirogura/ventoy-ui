@@ -23,7 +23,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import urlparse
 
-VERSION = "v0.0.1"
+VERSION = "v0.0.2"
 PORT = 3363
 BASE_DIR = Path(__file__).resolve().parent
 VENTOY_DIR = Path("/opt/ventoy")
@@ -77,6 +77,83 @@ def run_streaming(cmd, cwd=None, env=None):
     return proc.returncode
 
 
+def find_ventoy_script():
+    """Ventoy2Disk.sh の実体を探す。
+
+    v0.0.1 のダウンロード処理の不具合で /opt/ventoy/ventoy-x.y.zz/ 配下に
+    ネストして展開されている場合があるため、直下→ネスト→再帰の順で探索する。
+    """
+    direct = VENTOY_DIR / "Ventoy2Disk.sh"
+    if direct.is_file():
+        return direct
+    nested = sorted(VENTOY_DIR.glob("ventoy-*/Ventoy2Disk.sh"))
+    if nested:
+        return nested[0]
+    try:
+        for cand in sorted(VENTOY_DIR.rglob("Ventoy2Disk.sh")):
+            if cand.is_file():
+                return cand
+    except OSError:
+        pass
+    return direct
+
+
+def repair_ventoy_layout():
+    """ネスト展開・残留アーカイブ等のレイアウト崩れを修復する。"""
+    repaired = []
+    if (VENTOY_DIR / "Ventoy2Disk.sh").is_file():
+        base = str(VENTOY_DIR)
+        # v0.0.1 の不具合で残った重複ネスト (ventoy-x.y.zz/) があれば除去
+        for dup in sorted(VENTOY_DIR.glob("ventoy-*/Ventoy2Disk.sh")):
+            shutil.rmtree(dup.parent, ignore_errors=True)
+            repaired.append(f"重複した {dup.parent} を削除")
+    else:
+        nested = sorted(VENTOY_DIR.glob("ventoy-*/Ventoy2Disk.sh"))
+        if not nested:
+            return repaired
+        src_dir = nested[0].parent
+        for entry in os.listdir(src_dir):
+            s = os.path.join(src_dir, entry)
+            d = VENTOY_DIR / entry
+            if os.path.isdir(s) and not os.path.islink(s):
+                shutil.rmtree(d, ignore_errors=True)
+                shutil.copytree(s, d)
+            else:
+                try:
+                    if d.exists() or d.is_symlink():
+                        if d.is_dir() and not d.is_symlink():
+                            shutil.rmtree(d, ignore_errors=True)
+                        else:
+                            d.unlink()
+                except OSError:
+                    pass
+                shutil.copy2(s, d)
+        try:
+            if (VENTOY_DIR / "Ventoy2Disk.sh").is_file():
+                shutil.rmtree(src_dir, ignore_errors=True)
+                repaired.append(f"重複した {src_dir} を削除")
+            else:
+                os.rmdir(src_dir)
+        except OSError:
+            pass
+        repaired.append(f"nested dir {src_dir} を {VENTOY_DIR} 直下に昇格")
+        base = str(VENTOY_DIR)
+    # 展開時に混入したダウンロードアーカイブの残骸を除去
+    for leftover in sorted(VENTOY_DIR.glob("*.tar.gz")):
+        try:
+            leftover.unlink()
+            repaired.append(f"残留アーカイブ {leftover.name} を削除")
+        except OSError:
+            pass
+    # 実行権限の確保
+    for sh in VENTOY_DIR.glob("*.sh"):
+        try:
+            os.chmod(sh, 0o755)
+        except OSError:
+            pass
+    return repaired
+
+
 def get_ventoy_version():
     """インストール済みVentoyのバージョン推定。"""
     if not VENTOY_DIR.exists():
@@ -88,8 +165,10 @@ def get_ventoy_version():
             return tag_file.read_text().strip()
         except OSError:
             pass
+    script = find_ventoy_script()
+    home = script.parent if script.is_file() else VENTOY_DIR
     # tool内のバージョン情報ファイルを探索
-    for cand in (VENTOY_DIR / "tool").glob("ventoy-*"):
+    for cand in home.glob("tool/ventoy-*"):
         m = re.search(r"(\d+\.\d+\.\d+)", cand.name)
         if m:
             return f"v{m.group(1)}"
@@ -100,7 +179,7 @@ def get_ventoy_version():
         if m:
             return f"v{m.group(1)}"
     # Ventoy2Disk.sh が存在すれば「インストール済み(バージョン不明)」
-    if (VENTOY_DIR / "Ventoy2Disk.sh").exists():
+    if script.is_file():
         return "installed (unknown version)"
     return None
 
@@ -181,21 +260,39 @@ def download_ventoy_task():
         task_log(f"ダウンロード完了 ({os.path.getsize(archive)} bytes)")
         task_log(f"{VENTOY_DIR} に展開中...")
         with tarfile.open(archive, "r:gz") as tf:
-            members = tf.getmembers()
-            top = members[0].name.split("/")[0] if members and "/" in members[0].name else ""
             tf.extractall(tmp)
-        src = os.path.join(tmp, top) if top else tmp
-        if not os.path.exists(os.path.join(src, "Ventoy2Disk.sh")):
-            # トップレベル直展開の場合
-            src = tmp
+        # 展開結果から Ventoy2Disk.sh を含むディレクトリを特定する
+        # (tar の先頭メンバ名に依存しない。v0.0.1 では先頭メンバ判定の
+        # 失敗によりネスト展開・アーカイブ混入が起きた)
+        src = None
+        for root, _dirs, files in os.walk(tmp):
+            if "Ventoy2Disk.sh" in files:
+                src = root
+                break
+        if src is None:
+            task_log("展開結果に Ventoy2Disk.sh が見つかりませんでした")
+            task_finish(1)
+            return
         for entry in os.listdir(src):
+            if os.path.join(src, entry) == archive:
+                continue  # ダウンロードしたアーカイブ自体はコピーしない
             s = os.path.join(src, entry)
             d = VENTOY_DIR / entry
-            if os.path.isdir(s):
+            if os.path.isdir(s) and not os.path.islink(s):
                 shutil.rmtree(d, ignore_errors=True)
                 shutil.copytree(s, d)
             else:
+                try:
+                    if d.exists() or d.is_symlink():
+                        if d.is_dir() and not d.is_symlink():
+                            shutil.rmtree(d, ignore_errors=True)
+                        else:
+                            d.unlink()
+                except OSError:
+                    pass
                 shutil.copy2(s, d)
+        for msg in repair_ventoy_layout():
+            task_log(f"修復: {msg}")
         # 実行権限の確保
         for sh in VENTOY_DIR.glob("*.sh"):
             try:
@@ -244,11 +341,14 @@ def ensure_image_file(path: str, create: bool, size_gb: float):
 def install_ventoy_task(params: dict):
     rc = 1
     try:
-        script = VENTOY_DIR / "Ventoy2Disk.sh"
-        if not script.exists():
-            task_log(f"{script} が見つかりません。先に「Ventoyをダウンロード」を実行してください。")
+        script = find_ventoy_script()
+        if not script.is_file():
+            task_log(f"{VENTOY_DIR} に Ventoy2Disk.sh が見つかりません。先に「Ventoyをダウンロード」を実行してください。")
             task_finish(1)
             return
+        for msg in repair_ventoy_layout():
+            task_log(f"修復: {msg}")
+        script = find_ventoy_script()
         target_type = params.get("target_type", "usb")
         mode = params.get("mode", "install")  # install | force | update
         part_style = params.get("part_style", "GPT")
@@ -311,7 +411,7 @@ def install_ventoy_task(params: dict):
         task_log("Ventoy2Disk.sh を実行します (確認プロンプトには自動で yes と回答)")
         proc = subprocess.Popen(
             ["bash", "-c", f"yes | {' '.join(map(sh_quote, cmd))}"],
-            cwd=str(VENTOY_DIR),
+            cwd=str(script.parent),
             stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1,
         )
         for line in proc.stdout:
@@ -357,7 +457,7 @@ class Handler(BaseHTTPRequestHandler):
             self._send_json({
                 "version": VERSION,
                 "ventoy_dir": str(VENTOY_DIR),
-                "ventoy_installed": (VENTOY_DIR / "Ventoy2Disk.sh").exists(),
+                "ventoy_installed": find_ventoy_script().is_file(),
                 "ventoy_version": get_ventoy_version(),
                 "devices": devices,
                 "devices_error": err,
@@ -427,6 +527,8 @@ def restart_self():
 
 
 def main():
+    for msg in repair_ventoy_layout():
+        print(f"Ventoy-UI repair: {msg}", flush=True)
     server = ThreadingHTTPServer(("0.0.0.0", PORT), Handler)
     print(f"Ventoy-UI {VERSION} listening on :{PORT}", flush=True)
     try:

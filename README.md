@@ -1,4 +1,4 @@
-# ventoy-ui v0.0.1
+# ventoy-ui v0.0.2
 
 CachyOS (デスクトップ環境なし) で Webブラウザから Ventoy USB を作成するための Web-UI。
 GUI相当の設定をブラウザから行える。
