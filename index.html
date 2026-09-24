@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Ventoy-UI v0.0.4</title>
+<title>Ventoy-UI v0.0.5</title>
 <style>
   body { font-family: sans-serif; max-width: 760px; margin: 0 auto; padding: 16px; background: #f4f6f8; color: #222; }
   h1 { font-size: 1.6em; }
@@ -29,7 +29,7 @@
 </style>
 </head>
 <body>
-<h1>Ventoy-UI <span id="version">v0.0.4</span></h1>
+<h1>Ventoy-UI <span id="version">v0.0.5</span></h1>
 <p class="muted">CachyOS (デスクトップ環境なし) 向け Ventoy 作成 Web-UI ・ 3363番ポートで公開</p>
 
 <div class="card">
@@ -133,7 +133,7 @@ let logTimer = null;
 async function loadStatus() {
   const res = await fetch('/api/status');
   const j = await res.json();
-  document.getElementById('version').textContent = j.version || 'v0.0.4';
+  document.getElementById('version').textContent = j.version || 'v0.0.5';
   const st = j.ventoy_installed ? ('インストール済み' + (j.ventoy_version ? ' (' + j.ventoy_version + ')' : '')) : '未インストール';
   document.getElementById('ventoyStatus').textContent = st + ' @ ' + j.ventoy_dir;
   const sel = document.getElementById('device');
@@ -202,7 +202,7 @@ async function refreshIsoStatus() {
   const res = await fetch('/api/iso/status');
   const j = await res.json();
   const st = j.mounted
-    ? `マウント中: ${j.part}${j.label ? ' (ラベル: ' + j.label + ')' : ''} @ ${j.mountpoint}`
+    ? `${j.backend === 'guest' ? '接続中(guestfish)' : 'マウント中'}: ${j.part}${j.label ? ' (ラベル: ' + j.label + ')' : ''}${j.backend === 'guest' ? '' : ' @ ' + j.mountpoint}`
     : '未マウント';
   document.getElementById('isoMountStatus').textContent = st;
   const ul = document.getElementById('isoFiles');
@@ -271,6 +271,8 @@ function pollIsoDl() {
   }, 1000);
 }
 
+let isoPkgTimer = null;
+
 async function isoMount() {
   const t = document.querySelector('input[name=iso_target_type]:checked').value;
   const body = t === 'usb'
@@ -280,8 +282,41 @@ async function isoMount() {
   if (t === 'image' && !body.image_path) { alert('イメージパスを入力してください'); return; }
   const res = await fetch('/api/iso/mount', {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(body)});
   const j = await res.json();
+  if (j.need_install) {
+    const pkg = j.need_install.package;
+    if (confirm(`${pkg} をインストールしますか？\n理由: ${j.need_install.reason}\n\n${j.message}`)) {
+      isoInstallPkg(pkg);
+    } else {
+      refreshIsoStatus();
+    }
+    return;
+  }
   alert(j.message);
   refreshIsoStatus();
+}
+
+async function isoInstallPkg(pkg) {
+  const res = await fetch('/api/iso/install-pkg', {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({package: pkg})});
+  const j = await res.json();
+  if (!j.ok) { alert(j.message || j.error); return; }
+  setBusy(true);
+  if (isoPkgTimer) clearInterval(isoPkgTimer);
+  const box = document.getElementById('log');
+  isoPkgTimer = setInterval(async () => {
+    const r = await fetch('/api/task');
+    const t = await r.json();
+    box.textContent = (t.log || []).join('\n');
+    box.scrollTop = box.scrollHeight;
+    if (!t.running) {
+      clearInterval(isoPkgTimer); isoPkgTimer = null; setBusy(false); loadStatus();
+      if (t.returncode === 0) {
+        alert(`${pkg} のインストールが完了しました。マウントを再試行します。`);
+        isoMount();
+      } else {
+        alert(`${pkg} のインストールに失敗しました。ログを確認してください。`);
+      }
+    }
+  }, 1000);
 }
 
 async function isoUnmount() {
