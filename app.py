@@ -23,7 +23,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import urlparse
 
-VERSION = "v0.1.1"
+VERSION = "v0.1.2"
 PORT = 3363
 BASE_DIR = Path(__file__).resolve().parent
 VENTOY_DIR = Path("/opt/ventoy")
@@ -461,9 +461,27 @@ def guest_env():
     return env
 
 
+# マウント対象として受け付けないファイルシステム種別
+GUEST_REJECT_FSTYPES = frozenset({
+    "", "unknown", "swap", "LVM2_member", "linux_raid_member",
+    "crypto_LUKS", "isw_raid_member", "DM_snapshot_cow",
+})
+
+
+def guest_is_partition(dev: str) -> bool:
+    """/dev/sda のようなディスク全体ではなく /dev/sda2 のような
+    パーティションか (末尾数字必須)。"""
+    return bool(re.match(r"^/dev/.*[0-9]$", dev))
+
+
 def guest_probe(image: str):
     """guestfish でイメージ内のVentoyデータパーティション (第2パーティション) を特定する。
-    戻り値 (ok, dev, fstype_or_message)。"""
+    戻り値 (ok, dev, fstype_or_message)。
+
+    v0.1.1 まではパーティションが無い空イメージで list-filesystems が
+    "/dev/sda: unknown" のみを返した際に /dev/sda をそのまま採用し、
+    後の mount で status 32 エラーになっていた。
+    """
     try:
         r = subprocess.run(
             ["guestfish", "--ro", "-a", image, "run", ":", "list-filesystems"],
@@ -481,17 +499,19 @@ def guest_probe(image: str):
             continue
         dev, fst = line.split(":", 1)
         parts.append((dev.strip(), fst.strip()))
-    if not parts:
-        return False, "", "パーティションが見つかりません。イメージ内にVentoyが書き込まれていますか?"
-    # 第2パーティションを優先、無ければ最大の unknown 以外
-    dev = ""
-    for d, _fst in parts:
+    usable = [(d, f) for d, f in parts
+              if guest_is_partition(d) and f not in GUEST_REJECT_FSTYPES]
+    if not usable:
+        detail = ", ".join(f"{d} ({f})" for d, f in parts) or "(パーティションなし)"
+        return False, "", (
+            "イメージ内にVentoyデータパーティションが見つかりません "
+            f"[{detail}]。先にカード4「書き込み」でVentoyを書き込んでください。")
+    # 第2パーティション (Ventoyデータ領域の定位置) を優先
+    dev, fst = usable[0]
+    for d, f in usable:
         if d.endswith("2"):
-            dev = d
+            dev, fst = d, f
             break
-    if not dev:
-        dev = parts[-1][0]
-    fst = dict(parts).get(dev, "")
     return True, dev, fst
 
 
@@ -528,6 +548,9 @@ def guest_list(image: str, dev: str, force: bool = False):
 
 def guest_upload(image: str, dev: str, local: str, remote: str):
     """ローカルファイルをイメージ内パーティションへ書き込む。戻り値 (ok, message)。"""
+    if not guest_is_partition(dev):
+        return False, (f"{dev} はパーティションではありません。"
+                       "接続し直してください (空イメージの場合は先にVentoyを書き込んでください) 。")
     try:
         r = subprocess.run(
             ["guestfish", "--rw", "-a", image, "-m", dev,
