@@ -1,4 +1,4 @@
-# ventoy-ui v0.0.5
+# ventoy-ui v0.1.0
 
 CachyOS (デスクトップ環境なし) で Webブラウザから Ventoy USB を作成するための Web-UI。
 GUI相当の設定をブラウザから行える。
@@ -10,12 +10,25 @@ GUI相当の設定をブラウザから行える。
   Secure Boot (`-s`/`-S`)、予約領域 (`-r`)、ラベル (`-L`)、非破壊インストール (`-n`)
 - 管理: GitHubからアップデート (`git pull`)、Ventoy-UIの再起動
 
-## ISOイメージダウンロード (管理カードの上)
+## 6. Windows11用設定ファイル作成
+
+- ボタン一つで下記と等価の処理を実行
+  (`curl -LO https://raw.githubusercontent.com/hirogura/ventoy-win/main/ventoy-win.sh`
+  → `chmod +x` → `./ventoy-win.sh`、スクリプトは毎回取得し直す)
+- `ventoy/ventoy.json` (Win11チェック回避+自動インストール) と
+  `ventoy/autounattend.xml` を作成。対象はカード5でマウント中のVentoyパーティション
+  (未マウント時はUSB自動検出)。スクリプトの確認プロンプトには自動で `y` と回答し、
+  複数ISOがある場合は対象ファイル名の指定が必要
+
+## 5. ISOイメージダウンロード
 
 - USBメモリ / qcow2・img イメージ内の Ventoyデータパーティション (第2パーティション) を
   `/mnt/ventoy-iso` にマウントし、保存済みISOの一覧表示とアンマウントが可能
 - URL入力欄に `.iso` の直接リンクを入力してダウンロード (cachy-UI の Limine編集
   「または直接URLを入力」と同じ流儀: URL検証・進捗バー・キャンセル付き)
+- ダウンロード前に空き容量を事前チェックし、不足時は開始前にエラーを表示。
+  guestfish経由の保存時はディスク backed な `/var/tmp` を一時領域に使う
+  (tmpfs の `/tmp` だと大容量ISOで容量不足になるため)
 - qcow2 のマウントには `qemu-img` が必要 (`sudo pacman -S qemu-img`)。raw (.img) は `losetup` で対応
 - qcow2 マウント時は nbdモジュールのロード・空き `/dev/nbdN` の自動確保を行う
 - nbd/loop が使えない環境では guestfish (libguestfs) にフォールバック。

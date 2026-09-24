@@ -23,6 +23,7 @@ backup/
 backups/
 data/
 uploads/
+win11/
 
 *.pem
 *.key

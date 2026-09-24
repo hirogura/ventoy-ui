@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Ventoy-UI v0.0.5</title>
+<title>Ventoy-UI v0.1.0</title>
 <style>
   body { font-family: sans-serif; max-width: 760px; margin: 0 auto; padding: 16px; background: #f4f6f8; color: #222; }
   h1 { font-size: 1.6em; }
@@ -29,7 +29,7 @@
 </style>
 </head>
 <body>
-<h1>Ventoy-UI <span id="version">v0.0.5</span></h1>
+<h1>Ventoy-UI <span id="version">v0.1.0</span></h1>
 <p class="muted">CachyOS (デスクトップ環境なし) 向け Ventoy 作成 Web-UI ・ 3363番ポートで公開</p>
 
 <div class="card">
@@ -121,6 +121,19 @@
 </div>
 
 <div class="card">
+  <h2>6. Windows11用設定ファイル作成</h2>
+  <p class="muted">下記の内容を組み込んで実行します (取得は毎回最新化)。Ventoyパーティション直下に <code>ventoy/ventoy.json</code> (Win11チェック回避+自動インストール) と <code>ventoy/autounattend.xml</code> (日本語・ローカルuser・BitLocker無効化等) を作成します。</p>
+  <code>curl -LO https://raw.githubusercontent.com/hirogura/ventoy-win/main/ventoy-win.sh<br>
+  chmod +x ventoy-win.sh<br>
+  ./ventoy-win.sh</code>
+  <p class="muted">対象はカード5でマウント中のVentoyパーティション (未マウント時はUSB自動検出)。既存の同名ファイルは上書きされます。</p>
+  <label>対象ISOファイル名 (複数ISOがある場合のみ必須。空なら自動)
+    <input type="text" id="win11_iso" placeholder="例: Win11_25H2_Japanese_x64_v2.iso">
+  </label>
+  <button id="btnWin11" class="primary" onclick="runWin11()">Windows11用設定ファイルを作成する</button>
+</div>
+
+<div class="card">
   <h2>管理</h2>
   <button onclick="updateSelf()">GitHubからアップデート</button>
   <button onclick="restartApp()">Ventoy-UIの再起動</button>
@@ -133,7 +146,7 @@ let logTimer = null;
 async function loadStatus() {
   const res = await fetch('/api/status');
   const j = await res.json();
-  document.getElementById('version').textContent = j.version || 'v0.0.5';
+  document.getElementById('version').textContent = j.version || 'v0.1.0';
   const st = j.ventoy_installed ? ('インストール済み' + (j.ventoy_version ? ' (' + j.ventoy_version + ')' : '')) : '未インストール';
   document.getElementById('ventoyStatus').textContent = st + ' @ ' + j.ventoy_dir;
   const sel = document.getElementById('device');
@@ -386,6 +399,16 @@ async function restartApp() {
   setTimeout(() => location.reload(), 5000);
 }
 
+async function runWin11() {
+  const iso = document.getElementById('win11_iso').value.trim();
+  if (!confirm(`Windows11用設定ファイルを作成します。${iso ? '\n対象ISO: ' + iso : ''}\n既存の ventoy.json / autounattend.xml は上書きされます。よろしいですか?`)) return;
+  setBusy(true);
+  const res = await fetch('/api/win11', {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({iso_name: iso})});
+  const j = await res.json();
+  if (j.error) { alert(j.error); setBusy(false); return; }
+  pollLog();
+}
+
 async function pollLog() {
   if (logTimer) clearInterval(logTimer);
   const box = document.getElementById('log');
@@ -401,6 +424,7 @@ async function pollLog() {
 function setBusy(b) {
   document.getElementById('btnDownload').disabled = b;
   document.getElementById('btnWrite').disabled = b;
+  document.getElementById('btnWin11').disabled = b;
 }
 
 loadStatus();

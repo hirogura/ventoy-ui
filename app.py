@@ -23,7 +23,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import urlparse
 
-VERSION = "v0.0.5"
+VERSION = "v0.1.0"
 PORT = 3363
 BASE_DIR = Path(__file__).resolve().parent
 VENTOY_DIR = Path("/opt/ventoy")
@@ -901,7 +901,9 @@ def iso_start_download(url: str):
         names = {f["name"] for f in guest_list(image, dev, force=True)}
         if fname in names:
             return {"ok": False, "message": f"同名のファイルが既に存在します: {fname}"}
-        dest = os.path.join(tempfile.gettempdir(), f"ventoy-ui-iso-{fname}")
+        # /tmp は tmpfs で小さい場合があるためディスク backed な /var/tmp を使用
+        tmpdir = "/var/tmp" if os.path.isdir("/var/tmp") else tempfile.gettempdir()
+        dest = os.path.join(tmpdir, f"ventoy-ui-iso-{fname}")
         guest = (image, dev)
     else:
         if not (mounted and host_mounted):
@@ -910,6 +912,15 @@ def iso_start_download(url: str):
         if os.path.exists(dest):
             return {"ok": False, "message": f"同名のファイルが既に存在します: {fname}"}
         guest = None
+        tmpdir = str(ISO_MOUNT_POINT)
+    if total > 0:
+        try:
+            free = shutil.disk_usage(tmpdir).free
+            if free < total:
+                return {"ok": False,
+                        "message": f"空き容量不足です (必要: 約{total // 1024 // 1024}MB / 空き: 約{free // 1024 // 1024}MB @ {tmpdir})"}
+        except OSError:
+            pass
     total = -1
     try:
         req = urllib.request.Request(url, method="HEAD",
@@ -944,6 +955,109 @@ def install_pkg_task(package: str):
         task_log(f"{package} のインストールに失敗しました。手動で 'sudo pacman -S {package}' を実行してください。")
     else:
         task_log(f"{package} のインストールが完了しました。")
+    task_finish(rc)
+
+
+# ========== Windows11用設定ファイル作成 ==========
+# 下記の3コマンドと等価の処理をボタン一つで実行する。
+#   curl -LO https://raw.githubusercontent.com/hirogura/ventoy-win/main/ventoy-win.sh
+#   chmod +x ventoy-win.sh
+#   ./ventoy-win.sh
+# スクリプトは対話式 (確認プロンプト・複数ISO時の番号選択) のため、
+# バックエンド側で stdin 応答を事前生成してパイプする。
+WIN11_SCRIPT_URL = "https://raw.githubusercontent.com/hirogura/ventoy-win/main/ventoy-win.sh"
+WIN11_WORKDIR = BASE_DIR / "win11"
+
+
+def win11_list_root_isos(mnt: str):
+    """スクリプトの select_iso と同じ find|sort でルート直下ISOを列挙する。"""
+    try:
+        find = subprocess.run(["find", mnt, "-maxdepth", "1", "-type", "f",
+                               "-iname", "*.iso"],
+                              capture_output=True, text=True, timeout=30)
+        if find.returncode != 0:
+            return []
+        # 番号選択の順序をスクリプトと完全一致させるため sort(1) を使用
+        s = subprocess.run(["sort"], input=find.stdout,
+                           capture_output=True, text=True, timeout=30)
+        if s.returncode != 0:
+            return []
+        return [ln for ln in s.stdout.splitlines() if ln.strip()]
+    except Exception:  # noqa: BLE001
+        return []
+
+
+def win11_task(iso_name: str):
+    rc = 1
+    try:
+        WIN11_WORKDIR.mkdir(parents=True, exist_ok=True)
+        script = WIN11_WORKDIR / "ventoy-win.sh"
+        # 1. curl -LO (毎回取得し直して最新化)
+        task_log(f"$ curl -LO {WIN11_SCRIPT_URL}")
+        try:
+            req = urllib.request.Request(WIN11_SCRIPT_URL,
+                                         headers={"User-Agent": "Ventoy-UI"})
+            with urllib.request.urlopen(req, timeout=120) as resp, \
+                    open(script, "wb") as f:
+                shutil.copyfileobj(resp, f)
+        except Exception as e:  # noqa: BLE001
+            task_log(f"スクリプトの取得に失敗: {e}")
+            task_finish(1)
+            return
+        task_log(f"取得完了 ({script.stat().st_size} bytes)")
+        # 2. chmod +x
+        task_log("$ chmod +x ventoy-win.sh")
+        os.chmod(script, 0o755)
+        # 3. 実行対象の解決: カード5でホストマウント中ならそれを引数に、
+        #    否则スクリプトのUSB自動検出に任せる (引数なし)
+        with _iso_lock:
+            mounted = _iso_mount["mounted"]
+            backend = _iso_mount["backend"]
+        args = []
+        isos = []
+        if mounted and backend in ("direct", "nbd", "loop") and mountpoint_active():
+            args = [str(ISO_MOUNT_POINT)]
+            isos = win11_list_root_isos(str(ISO_MOUNT_POINT))
+            task_log(f"対象: {ISO_MOUNT_POINT} (カード5でマウント中)")
+        else:
+            task_log("対象: USB自動検出 (スクリプトに任せます)")
+        # 4. stdin 応答の事前生成 (確認 y + 複数ISO時の番号)
+        stdin_lines = ["y"]
+        if isos and len(isos) > 1:
+            if not iso_name:
+                task_log("エラー: ISOが複数あるため対象ファイル名を指定してください: "
+                         + ", ".join(os.path.basename(p) for p in isos))
+                task_finish(1)
+                return
+            names = [os.path.basename(p) for p in isos]
+            if iso_name not in names:
+                task_log(f"エラー: {iso_name} は対象内にありません: " + ", ".join(names))
+                task_finish(1)
+                return
+            stdin_lines.append(str(names.index(iso_name) + 1))
+            task_log(f"対象ISO: {iso_name} (選択肢 {names.index(iso_name) + 1})")
+        elif iso_name:
+            task_log(f"指定ISO名はスクリプトの自動検出時に参照されません (注意): {iso_name}")
+            task_log("※ ISO名の埋め込みはスクリプトが検出・選択したファイルで行われます。")
+        task_log(f"$ ./ventoy-win.sh {' '.join(args)}")
+        proc = subprocess.Popen(
+            ["bash", str(script)] + args, cwd=str(WIN11_WORKDIR),
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+            text=True, bufsize=1)
+        try:
+            proc.stdin.write("\n".join(stdin_lines) + "\n")
+            proc.stdin.close()
+        except BrokenPipeError:
+            pass
+        for line in proc.stdout:
+            task_log(line.rstrip())
+        proc.wait()
+        rc = proc.returncode
+        task_log(f"終了コード: {rc}")
+    except Exception as e:  # noqa: BLE001
+        task_log(f"エラー: {e}")
+        rc = 1
     task_finish(rc)
 
 
@@ -1038,6 +1152,14 @@ class Handler(BaseHTTPRequestHandler):
             else:
                 threading.Thread(target=install_pkg_task, args=(pkg,), daemon=True).start()
                 self._send_json({"ok": True, "message": f"{pkg} をインストールします"})
+        elif parsed.path == "/api/win11":
+            if not task_start("win11"):
+                self._send_json({"error": "他の処理が実行中です"}, 409)
+                return
+            threading.Thread(target=win11_task,
+                             args=((params.get("iso_name") or "").strip(),),
+                             daemon=True).start()
+            self._send_json({"ok": True})
         else:
             self._send_json({"error": "not found"}, 404)
 
