@@ -1,0 +1,202 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Ventoy-UI v0.0.1</title>
+<style>
+  body { font-family: sans-serif; max-width: 760px; margin: 0 auto; padding: 16px; background: #f4f6f8; color: #222; }
+  h1 { font-size: 1.6em; }
+  .card { background: #fff; border-radius: 10px; padding: 16px; margin: 12px 0; box-shadow: 0 1px 4px rgba(0,0,0,.1); }
+  .card h2 { margin-top: 0; font-size: 1.15em; border-bottom: 1px solid #eee; padding-bottom: 6px; }
+  button { font-size: 1em; padding: 10px 18px; border-radius: 8px; border: 1px solid #888; cursor: pointer; }
+  button.primary { background: #1976d2; color: #fff; border-color: #1976d2; }
+  button.danger { background: #c62828; color: #fff; border-color: #c62828; font-weight: bold; }
+  button:disabled { opacity: .5; cursor: wait; }
+  select, input[type=text], input[type=number] { font-size: 1em; padding: 8px; width: 100%; box-sizing: border-box; margin: 4px 0 10px; }
+  label { display: block; margin: 8px 0; }
+  .row { display: flex; gap: 12px; flex-wrap: wrap; }
+  .row > div { flex: 1; min-width: 200px; }
+  #log { background: #111; color: #0f0; font-family: monospace; font-size: .85em; height: 280px; overflow-y: auto; white-space: pre-wrap; padding: 10px; border-radius: 8px; }
+  .muted { color: #666; font-size: .9em; }
+  .warn { color: #c62828; font-weight: bold; }
+</style>
+</head>
+<body>
+<h1>Ventoy-UI <span id="version">v0.0.1</span></h1>
+<p class="muted">CachyOS (デスクトップ環境なし) 向け Ventoy 作成 Web-UI ・ 3363番ポートで公開</p>
+
+<div class="card">
+  <h2>1. Ventoyをダウンロード</h2>
+  <p>状態: <span id="ventoyStatus">確認中...</span></p>
+  <button id="btnDownload" class="primary" onclick="downloadVentoy()">Ventoyをダウンロード</button>
+  <p class="muted">/opt/ventoy を作成し、その中に最新の Ventoy (linux.tar.gz) をダウンロード・展開します。</p>
+</div>
+
+<div class="card">
+  <h2>2. 対象の選択</h2>
+  <label><input type="radio" name="target_type" value="usb" checked onchange="toggleTarget()"> USBドライブ (プルダウンで選択)</label>
+  <label><input type="radio" name="target_type" value="image" onchange="toggleTarget()"> イメージファイル (ventoy.qcow2 等)</label>
+  <div id="usbBox">
+    <select id="device"><option value="">-- 読込中 --</option></select>
+    <button onclick="loadStatus()">ドライブ一覧を更新</button>
+  </div>
+  <div id="imgBox" style="display:none">
+    <label>イメージファイルのパス (絶対パス)
+      <input type="text" id="image_path" value="/opt/ventoy.qcow2" placeholder="/opt/ventoy.qcow2">
+    </label>
+    <p class="muted">候補: <span id="imgCands">-</span></p>
+    <label><input type="checkbox" id="create_image"> 存在しない場合は新規作成する</label>
+    <label>新規作成サイズ (GiB)
+      <input type="number" id="image_size_gb" value="16" min="1" max="256" step="1">
+    </label>
+    <p class="muted">.qcow2 は qemu-img があれば qcow2形式、無ければ raw形式で作成します。qemu-img が無い場合は <code>sudo pacman -S qemu-img</code> で導入できます。</p>
+  </div>
+</div>
+
+<div class="card">
+  <h2>3. オプション (GUI相当)</h2>
+  <div class="row">
+    <div>
+      <label>パーティション形式</label>
+      <label><input type="radio" name="part_style" value="GPT" checked> GPT (デフォルト)</label>
+      <label><input type="radio" name="part_style" value="MBR"> MBR</label>
+    </div>
+    <div>
+      <label>処理モード</label>
+      <label><input type="radio" name="mode" value="install" checked> インストール (-i)</label>
+      <label><input type="radio" name="mode" value="force"> 強制インストール (-I)</label>
+      <label><input type="radio" name="mode" value="update"> アップデート (-u)</label>
+    </div>
+  </div>
+  <label><input type="checkbox" id="secure_boot" checked> Secure Boot サポートを有効にする (既定: ON / -s、OFFで -S)</label>
+  <label>末尾の予約領域 (MB / 0=なし / インストール時のみ有効)
+    <input type="number" id="preserve_mb" value="0" min="0" step="256">
+  </label>
+  <label>パーティションラベル (既定: Ventoy / 空なら既定値)
+    <input type="text" id="label" value="Ventoy">
+  </label>
+  <label><input type="checkbox" id="nondestructive"> 非破壊インストールを試みる (-n)</label>
+</div>
+
+<div class="card">
+  <h2>4. 書き込み</h2>
+  <p class="warn">書き込みを行うと対象ドライブ/ファイルのデータは消去されます。選択をよく確認してください。</p>
+  <button id="btnWrite" class="danger" onclick="writeVentoy()">書き込み</button>
+  <h3>ログ</h3>
+  <div id="log"></div>
+</div>
+
+<div class="card">
+  <h2>管理</h2>
+  <button onclick="updateSelf()">GitHubからアップデート</button>
+  <button onclick="restartApp()">Ventoy-UIの再起動</button>
+  <p class="muted">アップデートは <code>git pull</code> を実行します (リポジトリをプッシュ後に有効)。再起動は systemd (ventoy-ui.service) 経由を試み、失敗時はプロセスを再実行します。</p>
+</div>
+
+<script>
+let logTimer = null;
+
+async function loadStatus() {
+  const res = await fetch('/api/status');
+  const j = await res.json();
+  document.getElementById('version').textContent = j.version || 'v0.0.1';
+  const st = j.ventoy_installed ? ('インストール済み' + (j.ventoy_version ? ' (' + j.ventoy_version + ')' : '')) : '未インストール';
+  document.getElementById('ventoyStatus').textContent = st + ' @ ' + j.ventoy_dir;
+  const sel = document.getElementById('device');
+  const cur = sel.value;
+  sel.innerHTML = '';
+  if (!j.devices || j.devices.length === 0) {
+    const o = document.createElement('option');
+    o.value = ''; o.textContent = '-- USBドライブが見つかりません --';
+    sel.appendChild(o);
+  } else {
+    for (const d of j.devices) {
+      const o = document.createElement('option');
+      o.value = d.path;
+      o.textContent = `${d.path} (${d.size} / ${d.model} / ${d.tran})`.trim();
+      sel.appendChild(o);
+    }
+    if (cur) sel.value = cur;
+  }
+  document.getElementById('imgCands').textContent =
+    (j.images && j.images.length) ? j.images.map(i => i.path).join(', ') : '(候補なし。パスを直接入力してください)';
+}
+
+function toggleTarget() {
+  const t = document.querySelector('input[name=target_type]:checked').value;
+  document.getElementById('usbBox').style.display = t === 'usb' ? '' : 'none';
+  document.getElementById('imgBox').style.display = t === 'image' ? '' : 'none';
+}
+
+function val(name) { return document.querySelector(`input[name=${name}]:checked`).value; }
+
+async function downloadVentoy() {
+  if (!confirm('Ventoyを /opt/ventoy にダウンロード・展開します。よろしいですか?')) return;
+  setBusy(true);
+  await fetch('/api/download', {method: 'POST'});
+  pollLog();
+}
+
+async function writeVentoy() {
+  const t = val('target_type');
+  const target = t === 'usb' ? document.getElementById('device').value
+                             : document.getElementById('image_path').value;
+  if (!target) { alert('対象を選択/入力してください'); return; }
+  const mode = val('mode'), part = val('part_style');
+  if (!confirm(`本当に書き込みますか?\n対象: ${target}\nモード: ${mode}\n形式: ${part}\nデータは消去されます。`)) return;
+  const body = {
+    target_type: t,
+    device: document.getElementById('device').value,
+    image_path: document.getElementById('image_path').value,
+    create_image: document.getElementById('create_image').checked,
+    image_size_gb: parseFloat(document.getElementById('image_size_gb').value || '16'),
+    mode, part_style: part,
+    secure_boot: document.getElementById('secure_boot').checked,
+    preserve_mb: parseInt(document.getElementById('preserve_mb').value || '0', 10),
+    label: document.getElementById('label').value,
+    nondestructive: document.getElementById('nondestructive').checked,
+  };
+  setBusy(true);
+  const res = await fetch('/api/install', {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(body)});
+  const j = await res.json();
+  if (j.error) { alert(j.error); setBusy(false); return; }
+  pollLog();
+}
+
+async function updateSelf() {
+  if (!confirm('GitHubから git pull で更新します。よろしいですか?')) return;
+  setBusy(true);
+  await fetch('/api/update-self', {method: 'POST'});
+  pollLog();
+}
+
+async function restartApp() {
+  if (!confirm('Ventoy-UIを再起動します。よろしいですか?')) return;
+  await fetch('/api/restart', {method: 'POST'});
+  alert('再起動要求を送信しました。数秒後に再読み込みしてください。');
+  setTimeout(() => location.reload(), 5000);
+}
+
+async function pollLog() {
+  if (logTimer) clearInterval(logTimer);
+  const box = document.getElementById('log');
+  logTimer = setInterval(async () => {
+    const res = await fetch('/api/task');
+    const j = await res.json();
+    box.textContent = (j.log || []).join('\n');
+    box.scrollTop = box.scrollHeight;
+    if (!j.running) { clearInterval(logTimer); logTimer = null; setBusy(false); loadStatus(); }
+  }, 1000);
+}
+
+function setBusy(b) {
+  document.getElementById('btnDownload').disabled = b;
+  document.getElementById('btnWrite').disabled = b;
+}
+
+loadStatus();
+toggleTarget();
+</script>
+</body>
+</html>

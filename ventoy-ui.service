@@ -1,0 +1,15 @@
+[Unit]
+Description=Ventoy-UI (Ventoy web installer on :3363)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/ventoy-ui
+ExecStart=/usr/bin/python3 /opt/ventoy-ui/app.py
+Restart=on-failure
+# USB 書き込み・/opt/ventoy 作成のため root 実行を想定
+User=root
+
+[Install]
+WantedBy=multi-user.target
