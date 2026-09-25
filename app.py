@@ -23,7 +23,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import urlparse
 
-VERSION = "v0.1.5"
+VERSION = "v0.1.6"
 PORT = 3363
 BASE_DIR = Path(__file__).resolve().parent
 VENTOY_DIR = Path("/opt/ventoy")
@@ -816,7 +816,7 @@ def sh_quote(s: str) -> str:
 
 
 # ========== ISOイメージダウンロード (Ventoyパーティションへの保存) ==========
-# USBメモリ / qcow2・img イメージ内の Ventoyデータパーティション (第2パーティション)
+# USBメモリ / qcow2・img イメージ内の Ventoyデータパーティション (第1パーティション)
 # を /mnt/ventoy-iso にマウントし、URL指定で ISO を直接保存する。
 # URL入力・検証・進捗・キャンセルの流儀は cachy-UI の Limine編集
 # 「または直接URLを入力」ダウンロードに合わせている。
@@ -864,7 +864,7 @@ def guest_is_partition(dev: str) -> bool:
 
 
 def guest_probe(image: str):
-    """guestfish でイメージ内のVentoyデータパーティション (第2パーティション) を特定する。
+    """guestfish でイメージ内のVentoyデータパーティション (第1パーティション) を特定する。
     戻り値 (ok, dev, fstype_or_message)。
 
     v0.1.1 まではパーティションが無い空イメージで list-filesystems が
@@ -896,10 +896,10 @@ def guest_probe(image: str):
         return False, "", (
             "イメージ内にVentoyデータパーティションが見つかりません "
             f"[{detail}]。先にカード4「書き込み」でVentoyを書き込んでください。")
-    # 第2パーティション (Ventoyデータ領域の定位置) を優先
+    # 第1パーティション (Ventoyデータ領域=exFATの大容量側の定位置) を優先
     dev, fst = usable[0]
     for d, f in usable:
-        if d.endswith("2"):
+        if d.endswith("1"):
             dev, fst = d, f
             break
     return True, dev, fst
@@ -974,13 +974,23 @@ def guest_upload(image: str, dev: str, local: str, remote: str):
         return True, "イメージへ保存しました。"
 
 
-def second_partition(device: str) -> str:
-    """ディスク全体のデバイス名から第2パーティション名を求める。"""
+def first_partition(device: str) -> str:
+    """ディスク全体のデバイス名からVentoyデータパーティション (第1パーティション) 名を求める。
+
+    Ventoyの配置は part1=exFATデータ領域 (大容量) / part2=VTOYEFI (約32MiB)。
+    ISO保存やWin11設定は大容量側のpart1が正しい。v0.1.5まではpart2 (VTOYEFI)
+    をマウントしていたため容量不足になっていた。
+    """
     base = device.rstrip("/")
     # /dev/nvme0n1 / /dev/mmcblk0 / /dev/vda 等の末尾数字系は p を挿入
     if re.search(r"[0-9]$", base):
-        return f"{base}p2"
-    return f"{base}2"
+        return f"{base}p1"
+    return f"{base}1"
+
+
+def second_partition(device: str) -> str:
+    """旧名称のエイリアス (後方互換用)。first_partition() と同じ。"""
+    return first_partition(device)
 
 
 def part_label(part: str) -> str:
@@ -1087,7 +1097,7 @@ def iso_mount(target_type: str, target: str):
                 if r.returncode != 0:
                     return {"ok": False,
                             "message": f"qemu-nbd 接続失敗 ({nbd}): {(r.stderr or '').strip()}"}
-                backend, backing, part = "nbd", nbd, f"{nbd}p2"
+                backend, backing, part = "nbd", nbd, f"{nbd}p1"
             else:
                 if not shutil.which("losetup"):
                     return {"ok": False, "message": "イメージのマウントには losetup が必要です (util-linux) 。"}
@@ -1098,7 +1108,7 @@ def iso_mount(target_type: str, target: str):
                     # loopが使えない環境 (コンテナ等) では guestfish にフォールバック
                     return iso_mount_guest(
                         target, f"loop デバイスの割り当てに失敗: {(r.stderr or '').strip()}")
-                backend, backing, part = "loop", loop, f"{loop}p2"
+                backend, backing, part = "loop", loop, f"{loop}p1"
             if not wait_for_dev(part):
                 iso_cleanup_backend(backend, backing)
                 return {"ok": False,
@@ -1106,7 +1116,7 @@ def iso_mount(target_type: str, target: str):
         else:
             if not target.startswith("/dev/"):
                 return {"ok": False, "message": "USBドライブを選択してください (例: /dev/sdb) 。"}
-            part = second_partition(target)
+            part = first_partition(target)
             if not os.path.exists(part):
                 return {"ok": False, "message": f"{part} が見つかりません。先に Ventoy を書き込んでください。"}
         r = subprocess.run(["mount", part, str(ISO_MOUNT_POINT)],

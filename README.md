@@ -1,4 +1,4 @@
-# ventoy-ui v0.1.5
+# ventoy-ui v0.1.6
 
 CachyOS (デスクトップ環境なし) で Webブラウザから Ventoy USB を作成するための Web-UI。
 GUI相当の設定をブラウザから行える。
@@ -27,7 +27,7 @@ GUI相当の設定をブラウザから行える。
 
 ## 5. ISOイメージダウンロード
 
-- USBメモリ / qcow2・img イメージ内の Ventoyデータパーティション (第2パーティション) を
+- USBメモリ / qcow2・img イメージ内の Ventoyデータパーティション (第1パーティション) を
   `/mnt/ventoy-iso` にマウントし、保存済みISOの一覧表示とアンマウントが可能
 - URL入力欄に `.iso` の直接リンクを入力してダウンロード (cachy-UI の Limine編集
   「または直接URLを入力」と同じ流儀: URL検証・進捗バー・キャンセル付き)
