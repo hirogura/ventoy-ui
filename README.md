@@ -1,9 +1,10 @@
-# ventoy-ui v0.1.6
+# ventoy-ui v0.2.0
 
 CachyOS (デスクトップ環境なし) で Webブラウザから Ventoy USB を作成するための Web-UI。
 GUI相当の設定をブラウザから行える。
 
-- 公開ポート: `3363`
+- バインド: `127.0.0.1:3363` (LAN内には公開せず、Tailscale Serve経由でhttps公開)
+- ファビコン: USBメモリをイメージした `favicon.svg` を配信 (`/` と `/favicon.svg`・`/favicon.ico` に対応)
 - Ventoy ダウンロード先: `/opt/ventoy` (ボタンで作成・展開)
 - 対象: USBドライブ (プルダウン) / イメージファイル (`ventoy.qcow2` 等の任意パス)。
   イメージへの書き込みは qcow2→nbd・raw→loop でブロックデバイス接続してから
@@ -46,7 +47,11 @@ GUI相当の設定をブラウザから行える。
 ```bash
 # 直接起動
 sudo python3 /opt/ventoy-ui/app.py
-# http://<host>:3363 にアクセス
+# http://127.0.0.1:3363 にアクセス (または Tailscale Serve経由で https アクセス)
+
+# Tailscale Serveでhttps公開 (既存のServe設定は残したまま3363のみ追加)
+tailscale serve --bg --https=3363 http://127.0.0.1:3363
+tailscale serve status  # 既存の3339/3355/3362/8090等が残っていることを確認
 
 # systemd で常駐 (推奨)
 sudo cp /opt/ventoy-ui/ventoy-ui.service /etc/systemd/system/

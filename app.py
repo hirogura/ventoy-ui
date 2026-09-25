@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Ventoy-UI - CachyOS (デスクトップ環境なし) 向け Ventoy Web フロントエンド.
 
-- 3363番ポートで公開
+- 127.0.0.1:3363にバインド (LAN内には公開せず、Tailscale Serve経由でhttps公開)
 - GUI相当の設定 (GPT/MBR, インストール/アップデート, SecureBoot, 予約領域, ラベル, 非破壊インストール) を Web-UI で操作
 - /opt/ventoy にダウンロード・展開
 - USBドライブ / イメージファイル (ventoy.qcow2含む) を対象に選択可能
@@ -23,8 +23,9 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import urlparse
 
-VERSION = "v0.1.6"
+VERSION = "v0.2.0"
 PORT = 3363
+BIND = "127.0.0.1"
 BASE_DIR = Path(__file__).resolve().parent
 VENTOY_DIR = Path("/opt/ventoy")
 GITHUB_API_LATEST = "https://api.github.com/repos/ventoy/Ventoy/releases/latest"
@@ -1529,6 +1530,13 @@ class Handler(BaseHTTPRequestHandler):
             except OSError:
                 body = b"<h1>index.html not found</h1>"
             self._send(200, body)
+        elif parsed.path in ("/favicon.svg", "/favicon.ico"):
+            try:
+                body = (BASE_DIR / "favicon.svg").read_bytes()
+            except OSError:
+                self._send_json({"error": "not found"}, 404)
+                return
+            self._send(200, body, "image/svg+xml")
         elif parsed.path == "/api/version":
             self._send_json({"version": VERSION})
         elif parsed.path == "/api/status":
@@ -1638,8 +1646,9 @@ def restart_self():
 def main():
     for msg in repair_ventoy_layout():
         print(f"Ventoy-UI repair: {msg}", flush=True)
-    server = ThreadingHTTPServer(("0.0.0.0", PORT), Handler)
-    print(f"Ventoy-UI {VERSION} listening on :{PORT}", flush=True)
+    # LAN内には公開せず、Tailscale Serve経由でのみhttps公開する
+    server = ThreadingHTTPServer((BIND, PORT), Handler)
+    print(f"Ventoy-UI {VERSION} listening on {BIND}:{PORT}", flush=True)
     try:
         server.serve_forever()
     except KeyboardInterrupt:
