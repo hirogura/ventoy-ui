@@ -23,7 +23,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import urlparse
 
-VERSION = "v0.1.3"
+VERSION = "v0.1.4"
 PORT = 3363
 BASE_DIR = Path(__file__).resolve().parent
 VENTOY_DIR = Path("/opt/ventoy")
@@ -384,7 +384,17 @@ def install_ventoy_task(params: dict):
             target, attach_backend, attach_dev = attach_image_for_write(image_path)
             if not target:
                 task_log(attach_backend)  # エラーメッセージ
-                task_finish(1)
+                if nondestructive:
+                    task_log("非破壊インストールはイメージファイルに未対応です。"
+                             "通常/強制インストールを選択するかUSBを使用してください。")
+                    task_finish(1)
+                    return
+                task_log("カーネル接続不可のためユーザーランド書き込みを試みます")
+                ok, msg = userspace_write_image(
+                    image_path, mode, part_style.upper() == "GPT",
+                    secure_boot, preserve_mb, label)
+                task_log(msg)
+                task_finish(0 if ok else 1)
                 return
         else:
             target = (params.get("device") or "").strip()
@@ -473,6 +483,332 @@ def attach_image_for_write(image_path: str):
                       "この環境ではイメージへのVentoy書き込みはできません。"
                       "USBドライブへ書き込むか、loop対応ホストで実行してください。", "")
     return (loop, "loop", loop)
+
+
+# ========== イメージファイルへのVentoy書き込み (カーネル不要版) ==========
+# nbd/loop が使えない環境向けに VentoyWorker.sh の処理をファイル操作で再現する。
+# 必要な操作はパーティション作成と事前ビルド済みイメージのdd・UUID埋め込みのみで、
+# ファイル単位のコピーは発生しないため、カーネルマウントなしで完結する。
+def ventoy_dist_base():
+    script = find_ventoy_script()
+    return script.parent if script.is_file() else VENTOY_DIR
+
+
+def ventoy_sector_num():
+    try:
+        text = (ventoy_dist_base() / "tool" / "ventoy_lib.sh").read_text()
+        m = re.search(r"^VENTOY_SECTOR_NUM=(\d+)", text, re.M)
+        if m:
+            return int(m.group(1))
+    except OSError:
+        pass
+    return 65536
+
+
+def ventoy_tool(name: str) -> str:
+    import platform
+    machine = platform.machine()
+    if "aarch64" in machine or "arm64" in machine:
+        td = "aarch64"
+    elif "mips64" in machine:
+        td = "mips64el"
+    elif machine == "i386":
+        td = "i386"
+    else:
+        td = "x86_64"
+    p = ventoy_dist_base() / "tool" / td / name
+    return str(p) if p.is_file() else name
+
+
+def raw_write_bytes(path: str, data: bytes, byte_offset: int):
+    with open(path, "r+b") as f:
+        f.seek(byte_offset)
+        f.write(data)
+        f.flush()
+        os.fsync(f.fileno())
+
+
+def raw_read_bytes(path: str, byte_offset: int, size: int) -> bytes:
+    with open(path, "rb") as f:
+        f.seek(byte_offset)
+        return f.read(size)
+
+
+def raw_zero(path: str, byte_offset: int, size: int):
+    chunk = b"\x00" * (1024 * 1024)
+    with open(path, "r+b") as f:
+        f.seek(byte_offset)
+        left = size
+        while left > 0:
+            f.write(chunk[:min(len(chunk), left)])
+            left -= min(len(chunk), left)
+        f.flush()
+        os.fsync(f.fileno())
+
+
+def raw_copy_sparse(dst: str, src: str, dst_byte_offset: int):
+    """srcファイルの非ゼロ部分のみdstへ書き込む (高速化用)。"""
+    with open(src, "rb") as fin, open(dst, "r+b") as fout:
+        fout.seek(dst_byte_offset)
+        while True:
+            chunk = fin.read(1024 * 1024)
+            if not chunk:
+                break
+            if chunk.strip(b"\x00"):
+                fout.write(chunk)
+            else:
+                fout.seek(len(chunk), os.SEEK_CUR)
+        fout.flush()
+        os.fsync(fout.fileno())
+
+
+def ventoy_image_layout(total_sectors: int, gpt: bool, reserve_mb: int, V: int):
+    """VentoyWorker.sh の format_ventoy_disk_{mbr,gpt} と同じ配置計算。"""
+    if total_sectors <= V:
+        return None, "イメージが小さすぎます (Ventoy領域32MiB+データ領域が必要)"
+    p1start = 2048
+    if gpt:
+        if reserve_mb > 0:
+            p1end = total_sectors - (reserve_mb * 2048 + 33) - V - 1
+        else:
+            p1end = total_sectors - V - 34
+    else:
+        if reserve_mb > 0:
+            p1end = total_sectors - reserve_mb * 2048 - V - 1
+        else:
+            p1end = total_sectors - V - 1
+    p2start = p1end + 1
+    mod = p2start % 8
+    if mod:
+        p1end -= mod
+        p2start = p1end + 1
+    p2end = p2start + V - 1
+    if p1end <= p1start:
+        return None, "イメージが小さすぎます (予約領域指定が大きすぎる可能性)"
+    return {"p1start": p1start, "p1end": p1end,
+            "p2start": p2start, "p2end": p2end}, ""
+
+
+def ventoy_parse_image(path: str, V: int):
+    """イメージファイルの配置をMBR/GPTから読み取る。
+    戻り値 (info_or_None, message)。info には style/p2start/p2len を含む。"""
+    try:
+        mbr = raw_read_bytes(path, 0, 512)
+    except OSError as e:
+        return None, f"イメージ読み取り失敗: {e}"
+    if len(mbr) < 512 or mbr[510:512] != b"\x55\xaa":
+        return None, "パーティションテーブルが見つかりません (Ventoy未書き込みの可能性)"
+    t1 = mbr[450]
+    if t1 == 0xEE:
+        try:
+            hdr = raw_read_bytes(path, 512, 512)
+        except OSError as e:
+            return None, f"イメージ読み取り失敗: {e}"
+        if hdr[0:8] != b"EFI PART":
+            return None, "GPTヘッダが見つかりません"
+        import struct
+        entries_lba, _, entry_size = struct.unpack_from("<QII", hdr, 72)
+        e1 = raw_read_bytes(path, entries_lba * 512 + 128, 128)
+        if len(e1) < 128:
+            return None, "GPTエントリ読み取り失敗"
+        p2start, p2end = struct.unpack_from("<QQ", e1, 32)
+        return {"style": "GPT", "p2start": p2start,
+                "p2len": p2end - p2start + 1}, ""
+    import struct
+    p2start, p2len = struct.unpack_from("<II", mbr, 470)
+    return {"style": "MBR", "p2start": p2start, "p2len": p2len}, ""
+
+
+def ventoy_looks_installed(path: str, V: int) -> bool:
+    info, _ = ventoy_parse_image(path, V)
+    return bool(info and info["p2len"] == V and info["p2start"] > 2048)
+
+
+def qcow2_virtual_size(path: str):
+    """qcow2の仮想サイズ (bytes) を返す。取得不可時は None。"""
+    try:
+        r = subprocess.run(["qemu-img", "info", "--output=json", path],
+                           capture_output=True, text=True, timeout=60)
+        if r.returncode == 0:
+            return int(json.loads(r.stdout or "{}").get("virtual-size") or 0) or None
+    except Exception:  # noqa: BLE001
+        pass
+    return None
+
+
+def userspace_write_image(image_path: str, mode: str, gpt: bool,
+                          secure_boot: bool, reserve_mb: int, label: str):
+    """nbd/loopなしでイメージファイルにVentoyを書き込む。
+    戻り値 (ok, message)。"""
+    import lzma
+    base = ventoy_dist_base()
+    V = ventoy_sector_num()
+    need = {"boot/boot.img": 446, "boot/core.img.xz": 2047 * 512,
+            "ventoy/ventoy.disk.img.xz": V * 512}
+    blobs = {}
+    for rel, minimum in need.items():
+        p = base / rel
+        try:
+            data = p.read_bytes()
+        except OSError:
+            return False, f"Ventoy構成ファイルが見つかりません: {p}"
+        if rel.endswith(".xz"):
+            try:
+                data = lzma.decompress(data)
+            except Exception as e:  # noqa: BLE001
+                return False, f"{rel} の展開に失敗: {e}"
+        if len(data) < minimum:
+            return False, f"{rel} のサイズが想定外です ({len(data)} bytes)"
+        blobs[rel] = data
+    mkexfat = ventoy_tool("mkexfatfs")
+    vtoycli = ventoy_tool("vtoycli")
+    if mode == "force":
+        fresh = True
+    elif mode == "install":
+        fresh = True
+        if ventoy_looks_installed(image_path, V):
+            return False, ("イメージ内に既存Ventoyを検出しました。上書きする場合は"
+                           "強制インストール (-I) を選択してください。")
+    else:  # update
+        fresh = False
+    is_qcow2 = image_path.endswith(".qcow2")
+    work = image_path
+    tmpdir = tempfile.mkdtemp(prefix="ventoy-ui-img-")
+    try:
+        if is_qcow2:
+            if not shutil.which("qemu-img"):
+                return False, ("qcow2の変換には qemu-img が必要です "
+                               "(sudo pacman -S qemu-img) 。")
+            work = os.path.join(tmpdir, "work.raw")
+            if fresh:
+                if is_qcow2:
+                    size = qcow2_virtual_size(image_path)
+                    if not size:
+                        return False, "qcow2の仮想サイズを取得できません (qemu-img info失敗)"
+                else:
+                    size = os.path.getsize(image_path)
+                task_log(f"作業用rawイメージを作成します ({size} bytes)")
+                with open(work, "wb") as f:
+                    f.truncate(size)
+            else:
+                task_log("qcow2をrawに変換します (時間がかかる場合があります)")
+                r = subprocess.run(["qemu-img", "convert", "-O", "raw",
+                                    image_path, work],
+                                   capture_output=True, text=True, timeout=3600)
+                if r.returncode != 0:
+                    return False, f"qcow2の変換に失敗: {(r.stderr or '').strip()[-500:]}"
+        total_sectors = os.path.getsize(work) // 512
+        if fresh:
+            lay, msg = ventoy_image_layout(total_sectors, gpt, reserve_mb, V)
+            if not lay:
+                return False, msg
+            p1s, p1e, p2s = lay["p1start"], lay["p1end"], lay["p2start"]
+            task_log(f"配置: part1 {p1s}..{p1e} / part2(Ventoy) {p2s}..{p2s + V - 1} "
+                     f"({'GPT' if gpt else 'MBR'})")
+            raw_zero(work, 0, 32768)
+            if gpt:
+                task_log("GPTパーティションを作成します (parted)")
+                cmd = ["parted", "-a", "none", "--script", work,
+                       "mklabel", "gpt", "unit", "s",
+                       "mkpart", "Ventoy", "ntfs", str(p1s), str(p1e),
+                       "mkpart", "VTOYEFI", "fat16", str(p2s), str(p2s + V - 1),
+                       "set", "2", "msftdata", "on", "quit"]
+                r = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
+                if r.returncode != 0:
+                    return False, f"parted失敗: {(r.stderr or '').strip()[-500:]}"
+                r = subprocess.run([vtoycli, "gpt", "-f", work],
+                                   capture_output=True, text=True, timeout=120)
+                if r.returncode != 0:
+                    return False, (f"vtoycli gpt失敗: {(r.stderr or '').strip()[-500:]}")
+            else:
+                task_log("MBRパーティションを作成します (sfdisk)")
+                s1 = p1e - p1s + 1
+                sfdisk_script = (
+                    "label: dos\nunit: sectors\n"
+                    f"{work}1 : start={p1s}, size={s1}, type=7, bootable\n"
+                    f"{work}2 : start={p2s}, size={V}, type=ef\n")
+                r = subprocess.run(["sfdisk", work], input=sfdisk_script,
+                                   capture_output=True, text=True, timeout=120)
+                if r.returncode != 0:
+                    return False, f"sfdisk失敗: {(r.stderr or '').strip()[-500:]}"
+            raw_zero(work, p2s * 512, 32 * 512)
+            # part1 を exFAT でフォーマット (一時ファイルに作成してdd)
+            size_gb = total_sectors // 2097152
+            cluster = 256 if size_gb > 32 else 64
+            task_log(f"part1をexFATでフォーマットします (ラベル: {label or 'Ventoy'})")
+            p1tmp = os.path.join(tmpdir, "part1.fs")
+            with open(p1tmp, "wb") as f:
+                f.truncate((p1e - p1s + 1) * 512)
+            r = subprocess.run([mkexfat, "-n", label or "Ventoy",
+                                "-s", str(cluster), p1tmp],
+                               capture_output=True, text=True, timeout=600)
+            if r.returncode != 0:
+                return False, f"mkexfatfs失敗: {(r.stderr or '').strip()[-500:]}"
+            raw_copy_sparse(work, p1tmp, p1s * 512)
+            os.unlink(p1tmp)
+            raw_write_bytes(work, blobs["boot/boot.img"][:446], 0)
+            if gpt:
+                raw_write_bytes(work, b"\x22", 92)
+                raw_write_bytes(work, blobs["boot/core.img.xz"][:2014 * 512], 34 * 512)
+                raw_write_bytes(work, b"\x23", 17908)
+            else:
+                raw_write_bytes(work, blobs["boot/core.img.xz"][:2047 * 512], 512)
+            raw_write_bytes(work, blobs["ventoy/ventoy.disk.img.xz"][:V * 512],
+                            p2s * 512)
+            uuid = os.urandom(16)
+            raw_write_bytes(work, uuid, 384)
+            raw_write_bytes(work, uuid[12:16], 440)
+            task_log("Ventoyデータを書き込みました")
+        else:
+            info, msg = ventoy_parse_image(work, V)
+            if not info:
+                return False, msg
+            if info["p2len"] != V:
+                return False, (f"Ventoy領域サイズが想定外です ({info['p2len']} sectors)。"
+                               "このイメージはVentoy-UI以外で作成された可能性があります。")
+            p2s = info["p2start"]
+            task_log(f"既存配置を検出: {info['style']} / part2 start={p2s}。データは保持されます。")
+            uuid = raw_read_bytes(work, 384, 16)
+            rsv = raw_read_bytes(work, 2040 * 512, 8 * 512)
+            raw_write_bytes(work, blobs["boot/boot.img"][:440], 0)
+            raw_write_bytes(work, uuid, 384)
+            if info["style"] == "GPT":
+                raw_write_bytes(work, b"\x22", 92)
+                raw_write_bytes(work, blobs["boot/core.img.xz"][:2014 * 512], 34 * 512)
+                raw_write_bytes(work, b"\x23", 17908)
+            else:
+                mbr = raw_read_bytes(work, 0, 512)
+                if mbr[446] == 0x00 and mbr[462] == 0x80:
+                    raw_write_bytes(work, b"\x80", 446)
+                    raw_write_bytes(work, b"\x00", 462)
+                raw_write_bytes(work, blobs["boot/core.img.xz"][:2047 * 512], 512)
+            raw_write_bytes(work, rsv, 2040 * 512)
+            raw_write_bytes(work, blobs["ventoy/ventoy.disk.img.xz"][:V * 512],
+                            p2s * 512)
+            if info["style"] == "GPT":
+                r = subprocess.run([vtoycli, "gpt", "-f", work],
+                                   capture_output=True, text=True, timeout=120)
+                if r.returncode != 0:
+                    return False, (f"vtoycli gpt失敗: {(r.stderr or '').strip()[-500:]}")
+            task_log("ブート領域とVentoy領域を更新しました (データ保持)")
+        if not secure_boot:
+            task_log("Secure Boot無効化を適用します (vtoycli partresize)")
+            r = subprocess.run([vtoycli, "partresize", "-s", work, str(p2s if fresh else info["p2start"])],
+                               capture_output=True, text=True, timeout=300)
+            if r.returncode != 0:
+                return False, (f"Secure Boot無効化に失敗: {(r.stderr or '').strip()[-500:]} "
+                               "有効のまま使用するかUSB書き込みを利用してください。")
+        if is_qcow2:
+            task_log("qcow2に変換します (時間がかかる場合があります)")
+            r = subprocess.run(["qemu-img", "convert", "-O", "qcow2", work, image_path],
+                               capture_output=True, text=True, timeout=3600)
+            if r.returncode != 0:
+                return False, f"qcow2への変換に失敗: {(r.stderr or '').strip()[-500:]}"
+        return True, f"イメージへのVentoy書き込みが完了しました ({image_path})"
+    except OSError as e:
+        return False, f"イメージ書き込み中にエラー: {e}"
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
 
 
 def sh_quote(s: str) -> str:

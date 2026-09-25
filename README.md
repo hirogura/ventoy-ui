@@ -1,4 +1,4 @@
-# ventoy-ui v0.1.3
+# ventoy-ui v0.1.4
 
 CachyOS (デスクトップ環境なし) で Webブラウザから Ventoy USB を作成するための Web-UI。
 GUI相当の設定をブラウザから行える。
@@ -7,8 +7,10 @@ GUI相当の設定をブラウザから行える。
 - Ventoy ダウンロード先: `/opt/ventoy` (ボタンで作成・展開)
 - 対象: USBドライブ (プルダウン) / イメージファイル (`ventoy.qcow2` 等の任意パス)。
   イメージへの書き込みは qcow2→nbd・raw→loop でブロックデバイス接続してから
-  `Ventoy2Disk.sh` を実行 (ファイルパス直渡しはスクリプトが拒否するため)。
-  nbd/loop が無い環境ではイメージへの書き込み不可エラーを明示
+  `Ventoy2Disk.sh` を実行。nbd/loop が無い環境では `VentoyWorker.sh` と等価の
+  ユーザーランド書き込み (sfdisk/parted・事前ビルド済みイメージのdd・UUID埋め込み、
+  ファイルコピー不要のためカーネルマウント不要) に自動フォールバック。
+  非破壊インストールのみイメージでは未対応
 - オプション: GPT/MBR (既定 GPT)、インストール (`-i`) / 強制インストール (`-I`) / アップデート (`-u`)、
   Secure Boot (`-s`/`-S`)、予約領域 (`-r`)、ラベル (`-L`)、非破壊インストール (`-n`)
 - 管理: GitHubからアップデート (`git pull`)、Ventoy-UIの再起動
