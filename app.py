@@ -23,7 +23,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import urlparse
 
-VERSION = "v0.1.4"
+VERSION = "v0.1.5"
 PORT = 3363
 BASE_DIR = Path(__file__).resolve().parent
 VENTOY_DIR = Path("/opt/ventoy")
@@ -829,6 +829,9 @@ _iso_mount = {"mounted": False, "target_type": "", "target": "",
 _iso_dl = {"running": False, "filename": "", "received": 0, "total": -1,
            "done": False, "success": None, "message": "", "cancel": False}
 _iso_files_cache = {"files": [], "at": 0.0}
+# 同一qcow2への複数qemuプロセス同時アクセスは破損・書き込み失敗の原因になるため、
+# guestfish呼び出しは全てこのロックで直列化する
+_guest_lock = threading.Lock()
 
 # /api/iso/install-pkg で導入を許可するパッケージ (任意コマンド実行防止のallowlist)
 ISO_INSTALL_ALLOWLIST = ("libguestfs", "qemu-img")
@@ -868,15 +871,16 @@ def guest_probe(image: str):
     "/dev/sda: unknown" のみを返した際に /dev/sda をそのまま採用し、
     後の mount で status 32 エラーになっていた。
     """
-    try:
-        r = subprocess.run(
-            ["guestfish", "--ro", "-a", image, "run", ":", "list-filesystems"],
-            capture_output=True, text=True, timeout=GUESTFISH_TIMEOUT,
-            env=guest_env())
-    except subprocess.TimeoutExpired:
-        return False, "", "guestfish の応答がタイムアウトしました (初回はアプライアンス生成で数分かかります)。"
-    except Exception as e:  # noqa: BLE001
-        return False, "", f"guestfish 実行失敗: {e}"
+    with _guest_lock:
+        try:
+            r = subprocess.run(
+                ["guestfish", "--ro", "-a", image, "run", ":", "list-filesystems"],
+                capture_output=True, text=True, timeout=GUESTFISH_TIMEOUT,
+                env=guest_env())
+        except subprocess.TimeoutExpired:
+            return False, "", "guestfish の応答がタイムアウトしました (初回はアプライアンス生成で数分かかります)。"
+        except Exception as e:  # noqa: BLE001
+            return False, "", f"guestfish 実行失敗: {e}"
     if r.returncode != 0:
         return False, "", f"イメージ解析失敗: {(r.stderr or '').strip()[-500:]}"
     parts = []
@@ -901,33 +905,47 @@ def guest_probe(image: str):
     return True, dev, fst
 
 
+def guest_rm_locked(image: str, dev: str, remote: str):
+    """失敗時の部分ファイルを削除する (_guest_lock保持中に呼ぶこと)。"""
+    try:
+        subprocess.run(
+            ["guestfish", "--rw", "-a", image, "-m", dev,
+             "rm", remote],
+            capture_output=True, text=True, timeout=GUESTFISH_TIMEOUT,
+            env=guest_env())
+    except Exception:  # noqa: BLE001
+        pass
+    _iso_files_cache["at"] = 0.0
+
+
 def guest_list(image: str, dev: str, force: bool = False):
     """guestfish で / 直下の ISO一覧を取得 (15秒キャッシュ)。"""
     now = time.time()
     if not force and now - _iso_files_cache["at"] < 15 and _iso_files_cache["files"] is not None:
         return list(_iso_files_cache["files"])
     files = []
-    try:
-        r = subprocess.run(
-            ["guestfish", "--ro", "-a", image, "-m", dev, "ll", "/"],
-            capture_output=True, text=True, timeout=GUESTFISH_TIMEOUT,
-            env=guest_env())
-        if r.returncode == 0:
-            for line in (r.stdout or "").splitlines():
-                p = line.split()
-                if len(p) < 9 or not p[0].startswith("-"):
-                    continue
-                name = " ".join(p[8:])
-                if not name.lower().endswith(".iso"):
-                    continue
-                try:
-                    size = int(p[4])
-                except ValueError:
-                    size = -1
-                files.append({"name": name, "size": size})
-            files.sort(key=lambda x: x["name"])
-    except Exception:  # noqa: BLE001
-        pass
+    with _guest_lock:
+        try:
+            r = subprocess.run(
+                ["guestfish", "--ro", "-a", image, "-m", dev, "ll", "/"],
+                capture_output=True, text=True, timeout=GUESTFISH_TIMEOUT,
+                env=guest_env())
+            if r.returncode == 0:
+                for line in (r.stdout or "").splitlines():
+                    p = line.split()
+                    if len(p) < 9 or not p[0].startswith("-"):
+                        continue
+                    name = " ".join(p[8:])
+                    if not name.lower().endswith(".iso"):
+                        continue
+                    try:
+                        size = int(p[4])
+                    except ValueError:
+                        size = -1
+                    files.append({"name": name, "size": size})
+                files.sort(key=lambda x: x["name"])
+        except Exception:  # noqa: BLE001
+            pass
     _iso_files_cache.update({"files": files, "at": now})
     return files
 
@@ -937,20 +955,23 @@ def guest_upload(image: str, dev: str, local: str, remote: str):
     if not guest_is_partition(dev):
         return False, (f"{dev} はパーティションではありません。"
                        "接続し直してください (空イメージの場合は先にVentoyを書き込んでください) 。")
-    try:
-        r = subprocess.run(
-            ["guestfish", "--rw", "-a", image, "-m", dev,
-             "upload", local, remote],
-            capture_output=True, text=True, timeout=GUESTFISH_TIMEOUT,
-            env=guest_env())
-    except subprocess.TimeoutExpired:
-        return False, "イメージへの書き込みがタイムアウトしました。"
-    except Exception as e:  # noqa: BLE001
-        return False, f"イメージへの書き込み失敗: {e}"
-    if r.returncode != 0:
-        return False, f"イメージへの書き込み失敗: {(r.stderr or '').strip()[-500:]}"
-    _iso_files_cache["at"] = 0.0
-    return True, "イメージへ保存しました。"
+    with _guest_lock:
+        try:
+            r = subprocess.run(
+                ["guestfish", "--rw", "-a", image, "-m", dev,
+                 "upload", local, remote],
+                capture_output=True, text=True, timeout=GUESTFISH_TIMEOUT,
+                env=guest_env())
+        except subprocess.TimeoutExpired:
+            guest_rm_locked(image, dev, remote)
+            return False, "イメージへの書き込みがタイムアウトしました。"
+        except Exception as e:  # noqa: BLE001
+            return False, f"イメージへの書き込み失敗: {e}"
+        if r.returncode != 0:
+            guest_rm_locked(image, dev, remote)
+            return False, f"イメージへの書き込み失敗: {(r.stderr or '').strip()[-500:]}"
+        _iso_files_cache["at"] = 0.0
+        return True, "イメージへ保存しました。"
 
 
 def second_partition(device: str) -> str:
@@ -1040,6 +1061,8 @@ def iso_mount(target_type: str, target: str):
     with _iso_lock:
         if _iso_mount["mounted"] or mountpoint_active():
             return {"ok": False, "message": "既にマウントされています。先にアンマウントしてください。"}
+        if _iso_dl["running"]:
+            return {"ok": False, "message": "ISOダウンロード実行中です。完了後に操作してください。"}
     if task_snapshot()["running"]:
         return {"ok": False, "message": "他の処理 (ダウンロード/書き込み) が実行中です。完了後に操作してください。"}
     ISO_MOUNT_POINT.mkdir(parents=True, exist_ok=True)
@@ -1122,15 +1145,16 @@ def iso_mount_guest(target: str, prior_err: str):
     if not ok:
         return {"ok": False, "message": fst_or_msg}
     label = ""
-    try:
-        r = subprocess.run(
-            ["guestfish", "--ro", "-a", target, "-m", dev, "vfs-label", dev],
-            capture_output=True, text=True, timeout=GUESTFISH_TIMEOUT,
-            env=guest_env())
-        if r.returncode == 0:
-            label = (r.stdout or "").strip()
-    except Exception:  # noqa: BLE001
-        pass
+    with _guest_lock:
+        try:
+            r = subprocess.run(
+                ["guestfish", "--ro", "-a", target, "-m", dev, "vfs-label", dev],
+                capture_output=True, text=True, timeout=GUESTFISH_TIMEOUT,
+                env=guest_env())
+            if r.returncode == 0:
+                label = (r.stdout or "").strip()
+        except Exception:  # noqa: BLE001
+            pass
     with _iso_lock:
         _iso_mount.update({"mounted": True, "target_type": "image",
                            "target": target, "part": f"{dev} (guestfish)",
@@ -1195,7 +1219,11 @@ def iso_list_files():
         backend = _iso_mount["backend"]
         image = _iso_mount["backing_dev"] if backend == "guest" else ""
         dev = _iso_mount["part"].split(" ")[0] if backend == "guest" else ""
+        dl_running = _iso_dl["running"]
     if backend == "guest" and image and dev:
+        if dl_running:
+            # アップロード実行中は同一qcow2への同時アクセスを避けてキャッシュを返す
+            return list(_iso_files_cache["files"])
         return guest_list(image, dev)
     files = []
     if not mountpoint_active():

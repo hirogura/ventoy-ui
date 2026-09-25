@@ -1,4 +1,4 @@
-# ventoy-ui v0.1.4
+# ventoy-ui v0.1.5
 
 CachyOS (デスクトップ環境なし) で Webブラウザから Ventoy USB を作成するための Web-UI。
 GUI相当の設定をブラウザから行える。
@@ -38,7 +38,8 @@ GUI相当の設定をブラウザから行える。
 - qcow2 マウント時は nbdモジュールのロード・空き `/dev/nbdN` の自動確保を行う
 - nbd/loop が使えない環境では guestfish (libguestfs) にフォールバック。
   不足パッケージ (`libguestfs` / `qemu-img`) は「〜をインストールしますか?」の確認後に
-  自動導入 (pacman) し、マウントを再試行する
+  自動導入 (pacman) し、マウントを再試行する。
+  同一qcow2へのguestfish同時アクセスは直列化し、書き込み失敗時は部分ファイルを削除する
 
 ## 使い方
 
