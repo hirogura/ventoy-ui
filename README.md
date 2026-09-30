@@ -1,4 +1,4 @@
-# ventoy-ui v0.2.0
+# ventoy-ui v0.3.0
 
 CachyOS (デスクトップ環境なし) で Webブラウザから Ventoy USB を作成するための Web-UI。
 GUI相当の設定をブラウザから行える。
@@ -15,6 +15,18 @@ GUI相当の設定をブラウザから行える。
 - オプション: GPT/MBR (既定 GPT)、インストール (`-i`) / 強制インストール (`-I`) / アップデート (`-u`)、
   Secure Boot (`-s`/`-S`)、予約領域 (`-r`)、ラベル (`-L`)、非破壊インストール (`-n`)
 - 管理: GitHubからアップデート (`git pull`)、Ventoy-UIの再起動
+
+## 7. Windowsドライババックアップ・復元スクリプト作成
+
+- ボタン一つでUSBメモリ (Ventoyデータパーティション) 内に `driver-backup` フォルダを作成し、
+  `driver_backup.bat` / `driver_backup.ps1` / `driver_restore.bat` の3ファイルを書き込む
+  (リポジトリ内の `driver-scripts/` がテンプレート。USBへの書き込み時にCRLFへ変換)
+- バックアップはWindows側で `driver_backup.bat` を右クリック→「管理者として実行」
+  (`Export-WindowsDriver` で同じ場所の `drivers\` へエクスポート)、
+  復元は `driver_restore.bat` をダブルクリック (自動UAC昇格し `pnputil` で一括復元)
+- 対象はカード5でマウント中のVentoyパーティション (未マウント時はUSBドライブ /
+  イメージファイルを自動でマウント→書き込み→アンマウント)。guestfish接続中 (qcow2等) の場合は
+  イメージ内に直接書き込む。既存の同名ファイルは上書きされる
 
 ## 6. Windows11用設定ファイル作成
 

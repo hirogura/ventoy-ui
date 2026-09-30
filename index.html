@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <link rel="icon" type="image/svg+xml" href="/favicon.svg">
-<title>Ventoy-UI v0.2.0</title>
+<title>Ventoy-UI v0.3.0</title>
 <style>
   body { font-family: sans-serif; max-width: 760px; margin: 0 auto; padding: 16px; background: #f4f6f8; color: #222; }
   h1 { font-size: 1.6em; }
@@ -30,7 +30,7 @@
 </style>
 </head>
 <body>
-<h1>Ventoy-UI <span id="version">v0.2.0</span></h1>
+<h1>Ventoy-UI <span id="version">v0.3.0</span></h1>
 <p class="muted">CachyOS (デスクトップ環境なし) 向け Ventoy 作成 Web-UI ・ 127.0.0.1:3363にバインド (Tailscale Serve経由でhttps公開)</p>
 
 <div class="card">
@@ -135,6 +135,23 @@
 </div>
 
 <div class="card">
+  <h2>7. Windowsドライババックアップ・復元スクリプト作成</h2>
+  <p class="muted">USBメモリ (Ventoyデータパーティション) 内に <code>driver-backup</code> フォルダを作成し、Windows側で使う3ファイル (<code>driver_backup.bat</code> / <code>driver_backup.ps1</code> / <code>driver_restore.bat</code>) を書き込みます。バックアップは <code>driver_backup.bat</code> を右クリック→「管理者として実行」、復元は <code>driver_restore.bat</code> をダブルクリック (自動UAC昇格) します。</p>
+  <p>作成先の状態: <span id="driverStatus">確認中...</span></p>
+  <label><input type="radio" name="driver_target_type" value="usb" checked onchange="toggleDriverTarget()"> USBドライブのVentoyパーティション</label>
+  <label><input type="radio" name="driver_target_type" value="image" onchange="toggleDriverTarget()"> イメージファイル内のVentoyパーティション</label>
+  <div id="drvUsbBox">
+    <select id="drv_device"><option value="">-- 読込中 --</option></select>
+  </div>
+  <div id="drvImgBox" style="display:none">
+    <input type="text" id="drv_image_path" value="/opt/ventoy.qcow2" placeholder="/opt/ventoy.qcow2">
+  </div>
+  <p class="muted">カード5でマウント中の場合はそのパーティションへ書き込みます (未マウント時はここでマウントし、完了後にアンマウントします)。既存の同名ファイルは上書きされます。</p>
+  <ul id="driverFiles"><li class="muted">--</li></ul>
+  <button id="btnDriver" class="primary" onclick="runDriver()">スクリプトを作成する</button>
+</div>
+
+<div class="card">
   <h2>管理</h2>
   <button onclick="updateSelf()">GitHubからアップデート</button>
   <button onclick="restartApp()">Ventoy-UIの再起動</button>
@@ -147,7 +164,7 @@ let logTimer = null;
 async function loadStatus() {
   const res = await fetch('/api/status');
   const j = await res.json();
-  document.getElementById('version').textContent = j.version || 'v0.2.0';
+  document.getElementById('version').textContent = j.version || 'v0.3.0';
   const st = j.ventoy_installed ? ('インストール済み' + (j.ventoy_version ? ' (' + j.ventoy_version + ')' : '')) : '未インストール';
   document.getElementById('ventoyStatus').textContent = st + ' @ ' + j.ventoy_dir;
   const sel = document.getElementById('device');
@@ -184,7 +201,24 @@ async function loadStatus() {
     }
     if (icur) isel.value = icur;
   }
+  const dsel = document.getElementById('drv_device');
+  const dcur = dsel.value;
+  dsel.innerHTML = '';
+  if (!j.devices || j.devices.length === 0) {
+    const o = document.createElement('option');
+    o.value = ''; o.textContent = '-- USBドライブが見つかりません --';
+    dsel.appendChild(o);
+  } else {
+    for (const d of j.devices) {
+      const o = document.createElement('option');
+      o.value = d.path;
+      o.textContent = `${d.path} (${d.size} / ${d.model} / ${d.tran})`.trim();
+      dsel.appendChild(o);
+    }
+    if (dcur) dsel.value = dcur;
+  }
   refreshIsoStatus();
+  refreshDriverStatus();
 }
 
 function toggleTarget() {
@@ -199,6 +233,12 @@ function toggleIsoTarget() {
   const t = document.querySelector('input[name=iso_target_type]:checked').value;
   document.getElementById('isoUsbBox').style.display = t === 'usb' ? '' : 'none';
   document.getElementById('isoImgBox').style.display = t === 'image' ? '' : 'none';
+}
+
+function toggleDriverTarget() {
+  const t = document.querySelector('input[name=driver_target_type]:checked').value;
+  document.getElementById('drvUsbBox').style.display = t === 'usb' ? '' : 'none';
+  document.getElementById('drvImgBox').style.display = t === 'image' ? '' : 'none';
 }
 
 function fmtSize(b) {
@@ -416,6 +456,46 @@ async function runWin11() {
   pollLog();
 }
 
+async function runDriver() {
+  const t = document.querySelector('input[name=driver_target_type]:checked').value;
+  const body = t === 'usb'
+    ? {target_type: 'usb', device: document.getElementById('drv_device').value}
+    : {target_type: 'image', image_path: document.getElementById('drv_image_path').value};
+  if (t === 'usb' && !body.device) { alert('USBドライブを選択してください'); return; }
+  if (t === 'image' && !body.image_path) { alert('イメージパスを入力してください'); return; }
+  if (!confirm('USBメモリ内に driver-backup フォルダを作成し、ドライババックアップ・復元スクリプト (3ファイル) を書き込みます。既存の同名ファイルは上書きされます。よろしいですか?')) return;
+  setBusy(true);
+  const res = await fetch('/api/driver', {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(body)});
+  const j = await res.json();
+  if (j.error || j.ok === false) { alert(j.message || j.error); setBusy(false); return; }
+  pollLog();
+}
+
+async function refreshDriverStatus() {
+  try {
+    const res = await fetch('/api/driver/status');
+    const j = await res.json();
+    const st = !j.mounted ? '未マウント (カード5でマウントするか、下のボタンで自動作成します)'
+      : (j.exists ? `作成済み: ${j.mountpoint}/driver-backup` : '未作成');
+    document.getElementById('driverStatus').textContent = st;
+    const ul = document.getElementById('driverFiles');
+    ul.innerHTML = '';
+    if (!j.mounted) {
+      ul.innerHTML = '<li class="muted">マウントすると作成状態が表示されます</li>';
+    } else if (!j.files || j.files.length === 0) {
+      ul.innerHTML = '<li class="muted">(driver-backup なし)</li>';
+    } else {
+      for (const f of j.files) {
+        const li = document.createElement('li');
+        li.textContent = `${f.name} (${fmtSize(f.size)})`;
+        ul.appendChild(li);
+      }
+    }
+  } catch (e) {
+    document.getElementById('driverStatus').textContent = '確認失敗';
+  }
+}
+
 async function pollLog() {
   if (logTimer) clearInterval(logTimer);
   const box = document.getElementById('log');
@@ -432,11 +512,13 @@ function setBusy(b) {
   document.getElementById('btnDownload').disabled = b;
   document.getElementById('btnWrite').disabled = b;
   document.getElementById('btnWin11').disabled = b;
+  document.getElementById('btnDriver').disabled = b;
 }
 
 loadStatus();
 toggleTarget();
 toggleIsoTarget();
+toggleDriverTarget();
 </script>
 </body>
 </html>

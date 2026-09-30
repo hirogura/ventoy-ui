@@ -23,7 +23,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import urlparse
 
-VERSION = "v0.2.0"
+VERSION = "v0.3.0"
 PORT = 3363
 BIND = "127.0.0.1"
 BASE_DIR = Path(__file__).resolve().parent
@@ -1068,14 +1068,22 @@ def acquire_nbd():
 
 
 def iso_mount(target_type: str, target: str):
+    """Ventoyデータパーティションをマウントする。戻り値は dict(ok, message[, need_install])。
+
+    タスク実行中は拒否する。タスク内から呼ぶ場合は iso_mount_raw() を使う。
+    """
+    if task_snapshot()["running"]:
+        return {"ok": False, "message": "他の処理 (ダウンロード/書き込み) が実行中です。完了後に操作してください。"}
+    return iso_mount_raw(target_type, target)
+
+
+def iso_mount_raw(target_type: str, target: str):
     """Ventoyデータパーティションをマウントする。戻り値は dict(ok, message[, need_install])。"""
     with _iso_lock:
         if _iso_mount["mounted"] or mountpoint_active():
             return {"ok": False, "message": "既にマウントされています。先にアンマウントしてください。"}
         if _iso_dl["running"]:
             return {"ok": False, "message": "ISOダウンロード実行中です。完了後に操作してください。"}
-    if task_snapshot()["running"]:
-        return {"ok": False, "message": "他の処理 (ダウンロード/書き込み) が実行中です。完了後に操作してください。"}
     ISO_MOUNT_POINT.mkdir(parents=True, exist_ok=True)
     backend, backing, part = "direct", "", ""
     try:
@@ -1192,9 +1200,17 @@ def iso_cleanup_backend(backend: str, backing: str):
 
 
 def iso_unmount():
-    """マウント解除 + バックエンド後始末。戻り値 dict(ok, message)。"""
+    """マウント解除 + バックエンド後始末。戻り値 dict(ok, message)。
+
+    タスク実行中は拒否する。タスク内から呼ぶ場合は iso_unmount_raw() を使う。
+    """
     if task_snapshot()["running"]:
         return {"ok": False, "message": "他の処理 (ダウンロード/書き込み) が実行中です。完了後に操作してください。"}
+    return iso_unmount_raw()
+
+
+def iso_unmount_raw():
+    """マウント解除 + バックエンド後始末。戻り値 dict(ok, message)。"""
     with _iso_lock:
         if _iso_dl["running"]:
             return {"ok": False, "message": "ISOダウンロード実行中です。先にキャンセルしてください。"}
@@ -1509,6 +1525,203 @@ def win11_task(iso_name: str):
     task_finish(rc)
 
 
+# ========== Windowsドライババックアップ・復元スクリプト作成 (カード7) ==========
+# USBメモリ (Ventoyデータパーティション) 内に `driver-backup` フォルダを作成し、
+# driver-scripts/ 配下の3テンプレートを CRLF に変換して書き込む。
+# マウントの流儀はカード5 (ISOイメージダウンロード) をそのまま流用する。
+# (direct/nbd/loop のホストマウント or guestfish 接続中のパーティションを使用)
+DRIVER_SCRIPT_DIR = BASE_DIR / "driver-scripts"
+DRIVER_FILES = ("driver_backup.bat", "driver_backup.ps1", "driver_restore.bat")
+DRIVER_TARGET_SUBDIR = "driver-backup"
+
+
+def driver_to_crlf(data: bytes) -> bytes:
+    """テンプレート (LF) を Windows向け CRLF に変換する。"""
+    return data.replace(b"\r\n", b"\n").replace(b"\n", b"\r\n")
+
+
+def guest_mkdir_p(image: str, dev: str, remote: str):
+    """guestfish でイメージ内にディレクトリを作成する。戻り値 (ok, message)。"""
+    if not guest_is_partition(dev):
+        return False, (f"{dev} はパーティションではありません。"
+                       "接続し直してください (空イメージの場合は先にVentoyを書き込んでください) 。")
+    with _guest_lock:
+        try:
+            r = subprocess.run(
+                ["guestfish", "--rw", "-a", image, "-m", dev,
+                 "mkdir-p", remote],
+                capture_output=True, text=True, timeout=GUESTFISH_TIMEOUT,
+                env=guest_env())
+        except subprocess.TimeoutExpired:
+            return False, "イメージへの書き込みがタイムアウトしました。"
+        except Exception as e:  # noqa: BLE001
+            return False, f"イメージへの書き込み失敗: {e}"
+        if r.returncode != 0:
+            return False, f"イメージへの書き込み失敗: {(r.stderr or '').strip()[-500:]}"
+        _iso_files_cache["at"] = 0.0
+        return True, "作成しました。"
+
+
+def guest_list_dir(image: str, dev: str, remote: str):
+    """guestfish で指定ディレクトリ直下の一覧を取得する。存在しない場合は []。"""
+    files = []
+    with _guest_lock:
+        try:
+            r = subprocess.run(
+                ["guestfish", "--ro", "-a", image, "-m", dev, "ll", remote],
+                capture_output=True, text=True, timeout=GUESTFISH_TIMEOUT,
+                env=guest_env())
+            if r.returncode != 0:
+                return []
+            for line in (r.stdout or "").splitlines():
+                p = line.split()
+                if len(p) < 9 or not p[0].startswith("-"):
+                    continue
+                files.append({"name": " ".join(p[8:]),
+                              "size": int(p[4]) if p[4].isdigit() else -1})
+            files.sort(key=lambda x: x["name"])
+        except Exception:  # noqa: BLE001
+            pass
+    return files
+
+
+def driver_status():
+    with _iso_lock:
+        m = dict(_iso_mount)
+    host_mounted = mountpoint_active()
+    backend = m.get("backend", "")
+    if host_mounted and backend not in ("direct", "nbd", "loop"):
+        # 実マウントが残っている場合 (アプリ再起動後の残留マウント等) は通常のマウントとして扱う
+        backend = "direct"
+    if backend == "guest" and m.get("mounted"):
+        image = m.get("backing_dev", "")
+        dev = (m.get("part") or "").split(" ")[0]
+        files = guest_list_dir(image, dev, f"/{DRIVER_TARGET_SUBDIR}") if image and dev else []
+        return {"mounted": True, "target_type": m.get("target_type", ""),
+                "part": m.get("part", ""), "label": m.get("label", ""),
+                "backend": backend, "mountpoint": str(ISO_MOUNT_POINT),
+                "exists": len(files) > 0, "files": files}
+    if host_mounted:
+        dest = ISO_MOUNT_POINT / DRIVER_TARGET_SUBDIR
+        files = []
+        if dest.is_dir():
+            for name in sorted(os.listdir(dest)):
+                try:
+                    size = os.path.getsize(dest / name)
+                except OSError:
+                    size = -1
+                files.append({"name": name, "size": size})
+        return {"mounted": True, "target_type": m.get("target_type", ""),
+                "part": m.get("part", ""), "label": m.get("label", ""),
+                "backend": backend, "mountpoint": str(ISO_MOUNT_POINT),
+                "exists": dest.is_dir(), "files": files}
+    return {"mounted": False, "target_type": m.get("target_type", ""),
+            "part": "", "label": "", "backend": "",
+            "mountpoint": str(ISO_MOUNT_POINT),
+            "exists": False, "files": []}
+
+
+def driver_task(target_type: str, target: str):
+    """カード7の本体。カード5のマウントを流用し、必要なら自前でマウント→書き込み→解除する。"""
+    rc = 1
+    mounted_here = False
+    try:
+        missing = [n for n in DRIVER_FILES if not (DRIVER_SCRIPT_DIR / n).is_file()]
+        if missing:
+            task_log(f"テンプレートが見つかりません: {', '.join(missing)}")
+            task_finish(1)
+            return
+        with _iso_lock:
+            mounted = _iso_mount["mounted"]
+            backend = _iso_mount["backend"]
+            part = _iso_mount["part"]
+            image = _iso_mount["backing_dev"] if backend == "guest" else ""
+            dev = _iso_mount["part"].split(" ")[0] if backend == "guest" else ""
+        if mountpoint_active():
+            # 実際にマウントされている場合 (アプリ再起動後の残留マウント含む) はそれを使う。
+            # ビット列は /mnt/ventoy-iso の実体経由で書き込むため backend は direct 扱い。
+            # カード5のマウントは維持するため絶対にアンマウントしない。
+            backend = "direct"
+            task_log(f"マウント済みのパーティションに作成します: {part or ISO_MOUNT_POINT}")
+        elif backend == "guest" and mounted and image and dev:
+            task_log("guestfishで接続中のイメージに作成します (カード5の接続を利用)")
+        else:
+            res = iso_mount_raw(target_type, target)
+            if res.get("need_install"):
+                task_log(f"エラー: {res.get('message', '')}")
+                task_log("先にカード5「ISOイメージダウンロード」のマウントから必要パッケージを導入してください。")
+                task_finish(1)
+                return
+            if not res.get("ok"):
+                task_log(f"エラー: {res.get('message', 'マウントに失敗しました。')}")
+                task_finish(1)
+                return
+            task_log(res.get("message", ""))
+            mounted_here = True
+            with _iso_lock:
+                backend = _iso_mount["backend"]
+                part = _iso_mount["part"]
+                image = _iso_mount["backing_dev"]
+        if backend == "guest" and image:
+            dev = part.split(" ")[0]
+            task_log(f"対象: {image} 内の {dev} (guestfish接続中)")
+            ok, msg = guest_mkdir_p(image, dev, f"/{DRIVER_TARGET_SUBDIR}")
+            if not ok:
+                task_log(f"エラー: {DRIVER_TARGET_SUBDIR}/ の作成に失敗: {msg}")
+                task_finish(1)
+                return
+            task_log(f"{DRIVER_TARGET_SUBDIR}/ を作成/確認しました ({msg})")
+            tmpdir = tempfile.mkdtemp(prefix="ventoy-ui-driver-")
+            try:
+                for name in DRIVER_FILES:
+                    data = (DRIVER_SCRIPT_DIR / name).read_bytes()
+                    local = os.path.join(tmpdir, name)
+                    with open(local, "wb") as f:
+                        f.write(driver_to_crlf(data))
+                    ok, msg = guest_upload(image, dev, local, f"/{DRIVER_TARGET_SUBDIR}/{name}")
+                    task_log(f"{name}: {msg}")
+                    if not ok:
+                        task_log(f"エラー: {name} の書き込みに失敗: {msg}")
+                        task_finish(1)
+                        return
+            finally:
+                shutil.rmtree(tmpdir, ignore_errors=True)
+            task_log(f"3ファイルを作成しました: /{DRIVER_TARGET_SUBDIR}/")
+            rc = 0
+        else:
+            task_log(f"対象: {ISO_MOUNT_POINT} (バックエンド: {backend or 'direct'})")
+            dest = ISO_MOUNT_POINT / DRIVER_TARGET_SUBDIR
+            try:
+                dest.mkdir(parents=True, exist_ok=True)
+            except OSError as e:  # noqa: BLE001
+                task_log(f"エラー: {dest} の作成に失敗: {e}")
+                task_finish(1)
+                return
+            task_log(f"{dest} を作成/確認しました")
+            for name in DRIVER_FILES:
+                data = (DRIVER_SCRIPT_DIR / name).read_bytes()
+                try:
+                    (dest / name).write_bytes(driver_to_crlf(data))
+                except OSError as e:  # noqa: BLE001
+                    task_log(f"エラー: {dest / name} の書き込みに失敗: {e}")
+                    task_finish(1)
+                    return
+                task_log(f"{name} を作成しました ({len(driver_to_crlf(data))} bytes, CRLF)")
+            # exFAT/FAT のメタデータを確定させるため同期的に書き戻す
+            os.sync()
+            task_log(f"3ファイルを作成しました: {dest}")
+            rc = 0
+    except Exception as e:  # noqa: BLE001
+        task_log(f"エラー: {e}")
+        rc = 1
+    finally:
+        # カード7がマウントした場合のみ元に戻す (カード5のマウントは維持する)
+        if mounted_here:
+            task_log("書き込み後にアンマウントします。")
+            task_log(iso_unmount_raw().get("message", ""))
+    task_finish(rc)
+
+
 class Handler(BaseHTTPRequestHandler):
     server_version = f"Ventoy-UI/{VERSION}"
 
@@ -1554,6 +1767,8 @@ class Handler(BaseHTTPRequestHandler):
             self._send_json(task_snapshot())
         elif parsed.path == "/api/iso/status":
             self._send_json(iso_status())
+        elif parsed.path == "/api/driver/status":
+            self._send_json(driver_status())
         else:
             self._send_json({"error": "not found"}, 404)
 
@@ -1614,6 +1829,20 @@ class Handler(BaseHTTPRequestHandler):
             threading.Thread(target=win11_task,
                              args=((params.get("iso_name") or "").strip(),),
                              daemon=True).start()
+            self._send_json({"ok": True})
+        elif parsed.path == "/api/driver":
+            ttype = params.get("target_type", "usb")
+            tgt = (params.get("image_path") if ttype == "image"
+                   else params.get("device")) or ""
+            tgt = tgt.strip()
+            if not tgt:
+                self._send_json({"ok": False,
+                                 "message": "作成先のUSBドライブを選択、またはイメージパスを入力してください。"})
+                return
+            if not task_start("driver"):
+                self._send_json({"error": "他の処理が実行中です"}, 409)
+                return
+            threading.Thread(target=driver_task, args=(ttype, tgt), daemon=True).start()
             self._send_json({"ok": True})
         else:
             self._send_json({"error": "not found"}, 404)
