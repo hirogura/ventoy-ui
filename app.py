@@ -23,7 +23,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import urlparse
 
-VERSION = "v0.4.0"
+VERSION = "v0.5.0"
 PORT = 3363
 BIND = "127.0.0.1"
 BASE_DIR = Path(__file__).resolve().parent
@@ -1583,6 +1583,57 @@ def win11_task(iso_name: str):
     task_finish(rc)
 
 
+WIN11_TARGET_SUBDIR = "ventoy"
+WIN11_FILES = ("ventoy.json", "autounattend.xml")
+
+
+def win11_status():
+    """カード6の作成状態。マウント中のVentoyパーティション内の
+    ventoy/ventoy.json と ventoy/autounattend.xml の有無を返す。
+    判定の流儀は driver_status() (カード7) と同じ。
+    """
+    with _iso_lock:
+        m = dict(_iso_mount)
+    host_mounted = mountpoint_active()
+    backend = m.get("backend", "")
+    if host_mounted and backend not in ("direct", "nbd", "loop"):
+        # 実マウントが残っている場合 (アプリ再起動後の残留マウント等) は通常のマウントとして扱う
+        backend = "direct"
+    if backend == "guest" and m.get("mounted"):
+        image = m.get("backing_dev", "")
+        dev = (m.get("part") or "").split(" ")[0]
+        entries = guest_list_dir(image, dev, f"/{WIN11_TARGET_SUBDIR}") if image and dev else []
+        by_name = {e["name"]: e["size"] for e in entries}
+        files = [{"name": n, "exists": n in by_name,
+                  "size": by_name.get(n, -1)} for n in WIN11_FILES]
+        return {"mounted": True, "target_type": m.get("target_type", ""),
+                "part": m.get("part", ""), "label": m.get("label", ""),
+                "backend": backend, "mountpoint": str(ISO_MOUNT_POINT),
+                "exists": all(f["exists"] for f in files), "files": files}
+    if host_mounted:
+        ventoy_dir = ISO_MOUNT_POINT / WIN11_TARGET_SUBDIR
+        files = []
+        for n in WIN11_FILES:
+            p = ventoy_dir / n
+            if p.is_file():
+                try:
+                    size = os.path.getsize(p)
+                except OSError:
+                    size = -1
+                files.append({"name": n, "exists": True, "size": size})
+            else:
+                files.append({"name": n, "exists": False, "size": -1})
+        return {"mounted": True, "target_type": m.get("target_type", ""),
+                "part": m.get("part", ""), "label": m.get("label", ""),
+                "backend": backend, "mountpoint": str(ISO_MOUNT_POINT),
+                "exists": all(f["exists"] for f in files), "files": files}
+    return {"mounted": False, "target_type": m.get("target_type", ""),
+            "part": "", "label": "", "backend": "",
+            "mountpoint": str(ISO_MOUNT_POINT),
+            "exists": False,
+            "files": [{"name": n, "exists": False, "size": -1} for n in WIN11_FILES]}
+
+
 # ========== Windowsドライババックアップ・復元スクリプト作成 (カード7) ==========
 # USBメモリ (Ventoyデータパーティション) 内に `driver-backup` フォルダを作成し、
 # driver-scripts/ 配下の3テンプレートを CRLF に変換して書き込む。
@@ -1827,6 +1878,8 @@ class Handler(BaseHTTPRequestHandler):
             self._send_json(iso_status())
         elif parsed.path == "/api/driver/status":
             self._send_json(driver_status())
+        elif parsed.path == "/api/win11/status":
+            self._send_json(win11_status())
         else:
             self._send_json({"error": "not found"}, 404)
 
