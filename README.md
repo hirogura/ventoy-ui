@@ -1,4 +1,4 @@
-# ventoy-ui v0.3.0
+# ventoy-ui v0.4.0
 
 CachyOS (デスクトップ環境なし) で Webブラウザから Ventoy USB を作成するための Web-UI。
 GUI相当の設定をブラウザから行える。
@@ -36,7 +36,7 @@ GUI相当の設定をブラウザから行える。
 - `ventoy/ventoy.json` (Win11チェック回避+自動インストール) と
   `ventoy/autounattend.xml` を作成。対象はカード5でマウント中のVentoyパーティション
   (未マウント時はUSB自動検出)。スクリプトの確認プロンプトには自動で `y` と回答し、
-  複数ISOがある場合は対象ファイル名の指定が必要
+  複数ISOがある場合は対象ファイル名の指定が必要 (空欄時は `Windows11_Client_x64〜` を自動優先)
 
 ## 5. ISOイメージダウンロード
 

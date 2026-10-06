@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <link rel="icon" type="image/svg+xml" href="/favicon.svg">
-<title>Ventoy-UI v0.3.0</title>
+<title>Ventoy-UI v0.4.0</title>
 <style>
   body { font-family: sans-serif; max-width: 760px; margin: 0 auto; padding: 16px; background: #f4f6f8; color: #222; }
   h1 { font-size: 1.6em; }
@@ -30,7 +30,7 @@
 </style>
 </head>
 <body>
-<h1>Ventoy-UI <span id="version">v0.3.0</span></h1>
+<h1>Ventoy-UI <span id="version">v0.4.0</span></h1>
 <p class="muted">CachyOS (デスクトップ環境なし) 向け Ventoy 作成 Web-UI ・ 127.0.0.1:3363にバインド (Tailscale Serve経由でhttps公開)</p>
 
 <div class="card">
@@ -128,8 +128,8 @@
   chmod +x ventoy-win.sh<br>
   ./ventoy-win.sh</code>
   <p class="muted">対象はカード5でマウント中のVentoyパーティション (未マウント時はUSB自動検出)。既存の同名ファイルは上書きされます。</p>
-  <label>対象ISOファイル名 (複数ISOがある場合のみ必須。空なら自動)
-    <input type="text" id="win11_iso" placeholder="例: Win11_25H2_Japanese_x64_v2.iso">
+  <label>対象ISOファイル名 (複数ISOがある場合のみ必須。空なら自動 (Windows11_Client_x64〜を優先))
+    <input type="text" id="win11_iso" placeholder="例: Windows11_Client_x64_ja-jp_26300_9457.iso (空なら自動)">
   </label>
   <button id="btnWin11" class="primary" onclick="runWin11()">Windows11用設定ファイルを作成する</button>
 </div>
@@ -164,7 +164,7 @@ let logTimer = null;
 async function loadStatus() {
   const res = await fetch('/api/status');
   const j = await res.json();
-  document.getElementById('version').textContent = j.version || 'v0.3.0';
+  document.getElementById('version').textContent = j.version || 'v0.4.0';
   const st = j.ventoy_installed ? ('インストール済み' + (j.ventoy_version ? ' (' + j.ventoy_version + ')' : '')) : '未インストール';
   document.getElementById('ventoyStatus').textContent = st + ' @ ' + j.ventoy_dir;
   const sel = document.getElementById('device');

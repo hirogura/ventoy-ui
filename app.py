@@ -23,7 +23,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import urlparse
 
-VERSION = "v0.3.0"
+VERSION = "v0.4.0"
 PORT = 3363
 BIND = "127.0.0.1"
 BASE_DIR = Path(__file__).resolve().parent
@@ -1431,6 +1431,54 @@ def install_pkg_task(package: str):
 # バックエンド側で stdin 応答を事前生成してパイプする。
 WIN11_SCRIPT_URL = "https://raw.githubusercontent.com/hirogura/ventoy-win/main/ventoy-win.sh"
 WIN11_WORKDIR = BASE_DIR / "win11"
+# 空欄 (自動) 時に優先するISOファイル名の接頭辞 (小文字比較)。
+# Windows11 26H2 の配布名 (Windows11_Client_x64_ja-jp_26300_9457.iso 等) が対象となるようにする。
+WIN11_AUTO_ISO_PREFIXES = ("windows11_client_x64",)
+
+
+def win11_auto_pick(names):
+    """空欄時の自動選択。Windows11_Client_x64〜を優先する。戻り値は名前またはNone。"""
+    for prefix in WIN11_AUTO_ISO_PREFIXES:
+        for n in names:
+            if n.lower().startswith(prefix):
+                return n
+    return None
+
+
+def win11_patch_auto_select(script: Path):
+    """取得直後の ventoy-win.sh の select_iso() に自動優先ロジックを追記する。
+
+    複数ISO時の対話選択の前に Windows11_Client_x64〜 (*.iso) があれば
+    自動で採用して return する。取得スクリプトが将来変わって
+    追記位置が無い場合は何もせず False を返す。
+    """
+    try:
+        text = script.read_text()
+    except OSError:
+        return False
+    anchor = "        *)\n            local i sel"
+    if anchor not in text:
+        return False
+    patched = anchor.replace(
+        "            local i sel",
+        "            # Ventoy-UI(v0.4.0): 複数ISO時は Windows11_Client_x64〜を自動優先\n"
+        "            {\n"
+        '                local _w\n'
+        '                _w="$(printf \'%s\\n\' "${isos[@]}"'
+        " | grep -i '/Windows11_Client_x64[^/]*\\.iso$' | head -n 1 || true)\"\n"
+        '                if [ -n "${_w:-}" ]; then\n'
+        '                    ISO_NAME="$(basename "$_w")"\n'
+        '                    echo "自動選択: Windows11_Client_x64系ISO $ISO_NAME を使用します。"\n'
+        "                    return\n"
+        "                fi\n"
+        "            }\n"
+        "            local i sel",
+    )
+    try:
+        script.write_text(text.replace(anchor, patched))
+    except OSError:
+        return False
+    return True
 
 
 def win11_list_root_isos(mnt: str):
@@ -1472,6 +1520,10 @@ def win11_task(iso_name: str):
         # 2. chmod +x
         task_log("$ chmod +x ventoy-win.sh")
         os.chmod(script, 0o755)
+        # 2.5 未マウント時 (USB自動検出) でも空欄で Windows11_Client_x64〜が
+        #     対象となるよう、取得スクリプトの複数ISO選択に自動優先を追記する
+        if win11_patch_auto_select(script):
+            task_log("追記: 複数ISO時は Windows11_Client_x64〜を自動優先します")
         # 3. 実行対象の解決: カード5でホストマウント中ならそれを引数に、
         #    否则スクリプトのUSB自動検出に任せる (引数なし)
         with _iso_lock:
@@ -1488,12 +1540,18 @@ def win11_task(iso_name: str):
         # 4. stdin 応答の事前生成 (確認 y + 複数ISO時の番号)
         stdin_lines = ["y"]
         if isos and len(isos) > 1:
-            if not iso_name:
-                task_log("エラー: ISOが複数あるため対象ファイル名を指定してください: "
-                         + ", ".join(os.path.basename(p) for p in isos))
-                task_finish(1)
-                return
             names = [os.path.basename(p) for p in isos]
+            if not iso_name:
+                # 空欄 (自動): Windows11_Client_x64〜があれば自動で対象にする
+                auto = win11_auto_pick(names)
+                if auto:
+                    iso_name = auto
+                    task_log(f"自動選択: Windows11_Client_x64系ISO {auto} を使用します")
+                else:
+                    task_log("エラー: ISOが複数あるため対象ファイル名を指定してください: "
+                             + ", ".join(names))
+                    task_finish(1)
+                    return
             if iso_name not in names:
                 task_log(f"エラー: {iso_name} は対象内にありません: " + ", ".join(names))
                 task_finish(1)
